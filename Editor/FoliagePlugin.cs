@@ -26,6 +26,8 @@ public partial class FoliagePlugin : EditorPlugin
     private Label? _hint;
 
     private FoliageField? _field;
+    private FoliageField? _lastField;
+    private FoliageTypeInspector? _inspector;
     private Vector3? _brushAt;
     private Camera3D? _camera;
     private bool _stroking;
@@ -62,6 +64,8 @@ public partial class FoliagePlugin : EditorPlugin
         _toolbar.Visible = false;
         ToolButtons.StyleAll(_toolbar);
         AddControlToContainer(CustomControlContainer.SpatialEditorMenu, _toolbar);
+        _inspector = new FoliageTypeInspector(TextureNames);
+        AddInspectorPlugin(_inspector);
 
         _dock = new VBoxContainer { Name = "Foliage" };
         _hint = new Label { Text = "Select a FoliageField to paint with its types.", AutowrapMode = TextServer.AutowrapMode.WordSmart };
@@ -98,6 +102,8 @@ public partial class FoliagePlugin : EditorPlugin
         }
 
         PluginDocks.Remove(this, _dock);
+        if (_inspector is not null)
+            RemoveInspectorPlugin(_inspector);
     }
 
     /// <summary>Shows one of the plugin's icons in place of a button's text.</summary>
@@ -120,6 +126,7 @@ public partial class FoliagePlugin : EditorPlugin
     public override void _Edit(GodotObject? @object)
     {
         _field = @object as FoliageField;
+        _lastField = _field ?? _lastField;
         ShowTypes();
     }
 
@@ -134,6 +141,10 @@ public partial class FoliagePlugin : EditorPlugin
             UpdateOverlays();
         }
     }
+
+    /// <summary>The textures of the ground of the field last selected, or null if none has been: a type being edited has no field of its own.</summary>
+    private IReadOnlyList<string>? TextureNames() =>
+        _lastField is not null && IsInstanceValid(_lastField) && _lastField.IsInsideTree() ? _lastField.Ground()?.TextureNames : null;
 
     /// <summary>The field's types in the dock, each with a thumbnail of its scene once one is made.</summary>
     private void ShowTypes()
@@ -154,6 +165,10 @@ public partial class FoliagePlugin : EditorPlugin
             var type = types[i];
             if (type is null)
                 continue;
+            // By method name, as for the buttons. So a type renamed shows at once.
+            var renamed = new Callable(this, MethodName.ShowTypes);
+            if (!type.IsConnected(Resource.SignalName.Changed, renamed))
+                type.Connect(Resource.SignalName.Changed, renamed);
             var name = FoliageField.Name(type);
             var index = _list.AddItem(name);
             _list.SetItemMetadata(index, i);

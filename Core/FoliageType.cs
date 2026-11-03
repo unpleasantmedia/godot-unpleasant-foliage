@@ -12,6 +12,21 @@ namespace UnpleasantMedia.UnpleasantFoliage;
 [GlobalClass]
 public partial class FoliageType : Resource
 {
+    /// <summary>What it is called, in the Foliage dock; if not set, its file's or its scene's name. Also the resource's, so the field's list shows it.</summary>
+    [Export]
+    public string Name
+    {
+        get => _name;
+        set
+        {
+            _name = value;
+            ResourceName = value;
+            EmitChanged();
+        }
+    }
+
+    private string _name = "";
+
     /// <summary>What it looks like: its meshes and collision shapes are used, nothing else in it.</summary>
     [Export]
     public PackedScene? Scene { get; set; }
@@ -49,6 +64,13 @@ public partial class FoliageType : Resource
     /// <summary>How far each is sunk into the ground, so it does not float on a slope, in metres.</summary>
     [Export(PropertyHint.Range, "0,2,0.01,suffix:m")]
     public float Sink { get; set; } = 0.05f;
+
+    /// <summary>The names of the ground's textures it may be painted on, where one shows most; with none, it may be painted on any.</summary>
+    [Export]
+    public string[] AllowedTextures { get; set; } = [];
+
+    /// <summary>Whether it may be painted where this texture shows most; where the ground can't say, it may.</summary>
+    public bool AllowedOn(string? texture) => AllowedTextures.Length == 0 || texture is null || System.Array.IndexOf(AllowedTextures, texture) >= 0;
 
     /// <summary>What it is made of, taken from its scene: its meshes and its collision shapes, each placed as in the scene.</summary>
     public (List<(Mesh Mesh, Material? Material, Transform3D At)> Meshes, List<(Shape3D Shape, Transform3D At)> Shapes) Parts()

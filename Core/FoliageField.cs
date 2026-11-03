@@ -66,9 +66,19 @@ public partial class FoliageField : Node3D
 
     // Built each time it comes into the tree, not only the first: the editor takes a scene out of the
     // tree when another scene's tab is opened, and puts it back (without readying it again) on return.
-    public override void _EnterTree() => QueueRebuild();
+    public override void _EnterTree()
+    {
+        AddToGroup(Group);
+        QueueRebuild();
+    }
 
     public override void _ExitTree() => Clear();
+
+    /// <summary>The group every field in the tree is in.</summary>
+    public const string Group = "foliage_fields";
+
+    /// <summary>Every field in the tree: for another plugin to set its masks on.</summary>
+    public static IEnumerable<FoliageField> InTree(SceneTree tree) => tree.GetNodesInGroup(Group).OfType<FoliageField>();
 
     /// <summary>
     /// A type's key, for its places in the data: its file, when it has one of its own; or else
@@ -150,7 +160,7 @@ public partial class FoliageField : Node3D
 
         if (!_placed.TryGetValue(key, out var all) || !_parts.TryGetValue(key, out var parts))
             return;
-        var here = all.Where(t => Chunk(t) == (x, z)).ToList();
+        var here = all.Where(t => Chunk(t) == (x, z) && !Masked(t.Origin)).ToList();
         if (here.Count == 0)
             return;
 
@@ -219,6 +229,107 @@ public partial class FoliageField : Node3D
         }
 
         return numbers;
+    }
+
+    // ---- Masks ------------------------------------------------------------------------------
+
+    /// <summary>The areas where foliage is hidden, by the name each caller gave: not saved, so a caller sets them each time it loads.</summary>
+    private readonly Dictionary<string, (Vector2[] Outline, Rect2 Bounds)> _masks = [];
+
+    /// <summary>The areas masks changed in, to build again at the end of the frame.</summary>
+    private readonly List<Rect2> _maskChanges = [];
+
+    /// <summary>
+    /// Hides its foliage inside an outline, in world X and Z, until the mask is removed: it is drawn
+    /// and solid no more, but stays in its data. Setting a name again moves that mask.
+    /// </summary>
+    public void SetMask(string name, Vector2[] outline)
+    {
+        if (outline.Length < 3)
+        {
+            RemoveMask(name);
+            return;
+        }
+
+        var bounds = new Rect2(outline[0], Vector2.Zero);
+        foreach (var point in outline)
+            bounds = bounds.Expand(point);
+        if (_masks.TryGetValue(name, out var old))
+            MaskChanged(old.Bounds);
+        _masks[name] = ([.. outline], bounds);
+        MaskChanged(bounds);
+    }
+
+    /// <summary>A mask over a rectangle, in world X and Z.</summary>
+    public void SetMaskRect(string name, Rect2 area) =>
+        SetMask(name, [area.Position, area.Position + new Vector2(area.Size.X, 0f), area.End, area.Position + new Vector2(0f, area.Size.Y)]);
+
+    /// <summary>A mask over a circle, in world X and Z.</summary>
+    public void SetMaskCircle(string name, Vector2 centre, float radius)
+    {
+        var outline = new Vector2[48];
+        for (var i = 0; i < outline.Length; i++)
+            outline[i] = centre + Vector2.Right.Rotated(MathF.Tau * i / outline.Length) * radius;
+        SetMask(name, outline);
+    }
+
+    /// <summary>Takes a mask away: what it hid shows again.</summary>
+    public void RemoveMask(string name)
+    {
+        if (_masks.Remove(name, out var old))
+            MaskChanged(old.Bounds);
+    }
+
+    private void MaskChanged(Rect2 area)
+    {
+        if (_maskChanges.Count == 0 && IsInsideTree())
+            Callable.From(ApplyMasks).CallDeferred();
+        _maskChanges.Add(area);
+    }
+
+    /// <summary>Builds again the stretches masks changed in, each once however many masks were set.</summary>
+    private void ApplyMasks()
+    {
+        var changes = _maskChanges.ToList();
+        _maskChanges.Clear();
+        var touched = new HashSet<(string Key, int X, int Z)>();
+        bool Inside(Vector3 at) => changes.Any(c => c.HasPoint(new Vector2(at.X, at.Z)) || (at.X == c.End.X || at.Z == c.End.Y) && c.Grow(0.001f).HasPoint(new Vector2(at.X, at.Z)));
+        foreach (var (key, places) in _placed)
+        {
+            foreach (var place in places.Where(p => Inside(p.Origin)))
+                touched.Add((key, Chunk(place).X, Chunk(place).Z));
+        }
+
+        foreach (var (key, x, z) in touched)
+            BuildChunk(key, x, z);
+    }
+
+    /// <summary>Whether a place is under a mask.</summary>
+    private bool Masked(Vector3 at)
+    {
+        if (_masks.Count == 0)
+            return false;
+        var point = new Vector2(at.X, at.Z);
+        foreach (var (outline, bounds) in _masks.Values)
+        {
+            if (point.X >= bounds.Position.X && point.Y >= bounds.Position.Y && point.X <= bounds.End.X && point.Y <= bounds.End.Y && InOutline(outline, point))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool InOutline(Vector2[] outline, Vector2 point)
+    {
+        var inside = false;
+        for (int i = 0, j = outline.Length - 1; i < outline.Length; j = i++)
+        {
+            var (a, b) = (outline[i], outline[j]);
+            if (a.Y > point.Y != b.Y > point.Y && point.X < (b.X - a.X) * (point.Y - a.Y) / (b.Y - a.Y) + a.X)
+                inside = !inside;
+        }
+
+        return inside;
     }
 
     // ---- Thinning out trees ----------------------------------------------------------------
@@ -339,7 +450,7 @@ public partial class FoliageField : Node3D
     {
         if (!_chunks.TryGetValue((key, x, z), out var built) || !_parts.TryGetValue(key, out var parts))
             return;
-        var here = _placed[key].Where(t => Chunk(t) == (x, z)).ToList();
+        var here = _placed[key].Where(t => Chunk(t) == (x, z) && !Masked(t.Origin)).ToList();
         var toLocal = GlobalTransform.AffineInverse();
         for (var d = 0; d < built.Draws.Count && d < parts.Meshes.Count; d++)
         {
@@ -429,7 +540,7 @@ public partial class FoliageField : Node3D
                 var scale = Mathf.Lerp(type.MinScale, type.MaxScale, random.NextSingle());
                 var half = type.Spacing * scale / 2f;
                 var crownHalf = myCrown * scale / 2f;
-                if (near.Any(p => Flat(p.Origin - at) < (p.ByCrown ? crownHalf : half) + p.Half) || GroundAt(at) is not { } ground)
+                if (near.Any(p => Flat(p.Origin - at) < (p.ByCrown ? crownHalf : half) + p.Half) || Masked(at) || !type.AllowedOn(Ground()?.TextureAt(at)) || GroundAt(at) is not { } ground)
                     continue;
                 at.Y = ground.Height - type.Sink;
                 var up = Vector3.Up.Lerp(ground.Normal, type.FollowSlope).Normalized();
@@ -456,10 +567,10 @@ public partial class FoliageField : Node3D
         {
             if (!_placed.TryGetValue(key, out var places))
                 continue;
-            var gone = places.Where(p => Flat(p.Origin - centre) <= radius).ToList();
+            var gone = places.Where(p => Flat(p.Origin - centre) <= radius && !Masked(p.Origin)).ToList();
             if (gone.Count == 0)
                 continue;
-            places.RemoveAll(p => Flat(p.Origin - centre) <= radius);
+            places.RemoveAll(p => Flat(p.Origin - centre) <= radius && !Masked(p.Origin));
             foreach (var (X, Z) in gone.Select(Chunk).Distinct())
                 BuildChunk(key, X, Z);
         }
