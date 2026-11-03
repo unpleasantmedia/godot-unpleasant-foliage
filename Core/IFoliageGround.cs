@@ -25,8 +25,8 @@ public interface IFoliageGround
     /// <summary>The names of the ground's textures, for a type to pick those it may be painted on; none if it has no such thing.</summary>
     IReadOnlyList<string> TextureNames { get; }
 
-    /// <summary>The name of the texture showing most at a place, or null if it can't say.</summary>
-    string? TextureAt(Vector3 at);
+    /// <summary>How much of what is seen of the ground at a place is any of these textures (by name), from 0 to 1, or null if it can't say.</summary>
+    float? ShareOf(Vector3 at, IReadOnlyCollection<string> textures);
 
     /// <summary>Has a callable called with the area (a Rect2, in world X and Z) whenever the ground changes there, if it isn't already.</summary>
     void Follow(Callable changed);

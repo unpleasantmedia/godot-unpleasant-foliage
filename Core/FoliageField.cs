@@ -540,7 +540,7 @@ public partial class FoliageField : Node3D
                 var scale = Mathf.Lerp(type.MinScale, type.MaxScale, random.NextSingle());
                 var half = type.Spacing * scale / 2f;
                 var crownHalf = myCrown * scale / 2f;
-                if (near.Any(p => Flat(p.Origin - at) < (p.ByCrown ? crownHalf : half) + p.Half) || Masked(at) || !type.AllowedOn(Ground()?.TextureAt(at)) || GroundAt(at) is not { } ground)
+                if (near.Any(p => Flat(p.Origin - at) < (p.ByCrown ? crownHalf : half) + p.Half) || Masked(at) || !type.AllowedAt(Ground(), at) || GroundAt(at) is not { } ground)
                     continue;
                 at.Y = ground.Height - type.Sink;
                 var up = Vector3.Up.Lerp(ground.Normal, type.FollowSlope).Normalized();

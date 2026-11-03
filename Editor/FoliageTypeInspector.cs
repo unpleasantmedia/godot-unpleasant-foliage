@@ -1,5 +1,4 @@
 #if TOOLS
-using System;
 using System.Collections.Generic;
 using System.Linq;
 using Godot;
@@ -10,22 +9,28 @@ namespace UnpleasantMedia.UnpleasantFoliage.Editor;
 [Tool]
 public partial class FoliageTypeInspector : EditorInspectorPlugin
 {
-    private readonly Func<IReadOnlyList<string>?> _textures = () => null;
-
-    public FoliageTypeInspector()
-    {
-    }
-
-    public FoliageTypeInspector(Func<IReadOnlyList<string>?> textures) => _textures = textures;
-
     public override bool _CanHandle(GodotObject @object) => @object is FoliageType;
 
     public override bool _ParseProperty(GodotObject @object, Variant.Type type, string name, PropertyHint hintType, string hintString, PropertyUsageFlags usageFlags, bool wide)
     {
         if (name != FoliageType.PropertyName.AllowedTextures.ToString())
             return false;
-        AddPropertyEditor(name, new AllowedTexturesProperty(_textures()));
+        AddPropertyEditor(name, new AllowedTexturesProperty(TextureNames()));
         return true;
+    }
+
+    /// <summary>
+    /// The textures of the ground of the field in the Inspector, or else the first in the scene, or null
+    /// if the scene has none: a type being edited has no field of its own, and the Inspector draws
+    /// a field's types before the plugin is told it is selected. Found here each time, as the
+    /// editor makes this object anew when the scripts are rebuilt.
+    /// </summary>
+    private static IReadOnlyList<string>? TextureNames()
+    {
+        var root = EditorInterface.Singleton.GetEditedSceneRoot();
+        var field = EditorInterface.Singleton.GetInspector().GetEditedObject() as FoliageField
+            ?? (root is null ? null : FoliageField.InTree(root.GetTree()).FirstOrDefault(f => root.IsAncestorOf(f)));
+        return field is { } found && found.IsInsideTree() ? found.Ground()?.TextureNames ?? [] : null;
     }
 }
 
@@ -56,9 +61,9 @@ public partial class AllowedTexturesProperty : EditorProperty
     {
         var allowed = GetEditedObject().Get(GetEditedProperty()).AsStringArray();
         var known = _textures ?? [];
-        _note.Text = _textures is null ? "Select a FoliageField to choose from its ground's textures."
+        _note.Text = _textures is null ? "Open a scene with a FoliageField to choose from its ground's textures."
             : known.Count == 0 ? "This ground has no textures to choose from."
-            : "Allowed where a ticked texture shows most. None ticked: allowed on any.";
+            : "Allowed only where nothing but ticked textures shows, so in a fade only between them. None ticked: allowed on any.";
         var wanted = known.Concat(allowed.Except(known)).ToList();
         if (!wanted.SequenceEqual(_boxes.Keys))
         {

@@ -52,7 +52,7 @@ internal static class FoliageHook
 
 Set `FoliageGround.DataFolder` to choose where new data files go. By default they go beside the level.
 
-`IFoliageGround` also gives the texture names (`TextureNames`) and the texture showing most at a place (`TextureAt`). If your ground has no textures, return an empty list and null.
+`IFoliageGround` also gives the texture names (`TextureNames`) and how much of the ground at a place shows some of them, from 0 to 1 (`ShareOf`). If your ground has no textures, return an empty list and null.
 
 ## Use
 
@@ -61,7 +61,7 @@ Set `FoliageGround.DataFolder` to choose where new data files go. By default the
 3. Select the field, pick types in the **Foliage** dock, and choose **Paint** or **Erase** in the 3D view's toolbar.
 4. Drag on the ground. Ctrl-drag erases whichever tool is on. With **All** ticked, Erase takes away every type.
 
-A type's **Name** is what the dock and the field's list show. Its **Allowed Textures** are ticked from the ground of the field you last selected, so select the field first. A type is only painted where a ticked texture shows most; with none ticked it can go anywhere. Foliage that's already painted stays where it is.
+A type's **Name** is what the dock and the field's list show. Its **Allowed Textures** are ticked from the ground of the selected field, or of the first field in the open scene. A type is only painted where nothing but ticked textures shows, so in a fade it only goes between two ticked textures; with none ticked it can go anywhere. Foliage that's already painted stays where it is.
 
 What you paint is saved to a `FoliageData` file of its own, made the first time you paint.
 

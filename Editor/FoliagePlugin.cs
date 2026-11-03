@@ -26,7 +26,6 @@ public partial class FoliagePlugin : EditorPlugin
     private Label? _hint;
 
     private FoliageField? _field;
-    private FoliageField? _lastField;
     private FoliageTypeInspector? _inspector;
     private Vector3? _brushAt;
     private Camera3D? _camera;
@@ -64,7 +63,7 @@ public partial class FoliagePlugin : EditorPlugin
         _toolbar.Visible = false;
         ToolButtons.StyleAll(_toolbar);
         AddControlToContainer(CustomControlContainer.SpatialEditorMenu, _toolbar);
-        _inspector = new FoliageTypeInspector(TextureNames);
+        _inspector = new FoliageTypeInspector();
         AddInspectorPlugin(_inspector);
 
         _dock = new VBoxContainer { Name = "Foliage" };
@@ -126,7 +125,6 @@ public partial class FoliagePlugin : EditorPlugin
     public override void _Edit(GodotObject? @object)
     {
         _field = @object as FoliageField;
-        _lastField = _field ?? _lastField;
         ShowTypes();
     }
 
@@ -141,10 +139,6 @@ public partial class FoliagePlugin : EditorPlugin
             UpdateOverlays();
         }
     }
-
-    /// <summary>The textures of the ground of the field last selected, or null if none has been: a type being edited has no field of its own.</summary>
-    private IReadOnlyList<string>? TextureNames() =>
-        _lastField is not null && IsInstanceValid(_lastField) && _lastField.IsInsideTree() ? _lastField.Ground()?.TextureNames : null;
 
     /// <summary>The field's types in the dock, each with a thumbnail of its scene once one is made.</summary>
     private void ShowTypes()
