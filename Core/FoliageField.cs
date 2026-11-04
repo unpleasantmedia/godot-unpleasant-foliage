@@ -146,36 +146,33 @@ public partial class FoliageField : Node3D
 
     private static (int X, int Z) Chunk(Transform3D at) => ((int)MathF.Floor(at.Origin.X / ChunkSize), (int)MathF.Floor(at.Origin.Z / ChunkSize));
 
-    /// <summary>Builds one stretch of one type again, from its places there.</summary>
+    /// <summary>
+    /// Builds one stretch of one type again, from its places there: in the nodes it already has, if it
+    /// has them, as adding and taking away nodes makes the editor go over the whole level again.
+    /// </summary>
     private void BuildChunk(string key, int x, int z)
     {
-        if (_chunks.Remove((key, x, z), out var old))
-        {
-            foreach (var built in old.Draws.Cast<Node>().Append(old.Body).OfType<Node>())
-            {
-                RemoveChild(built);
-                built.QueueFree();
-            }
-        }
-
         if (!_placed.TryGetValue(key, out var all) || !_parts.TryGetValue(key, out var parts))
             return;
         var here = all.Where(t => Chunk(t) == (x, z) && !Masked(t.Origin)).ToList();
-        if (here.Count == 0)
+        var built = _chunks.TryGetValue((key, x, z), out var old);
+        if (here.Count == 0 && !built)
             return;
 
         // Placed as it is (its own place in the world aside): its foliage is where it was painted.
         var toLocal = GlobalTransform.AffineInverse();
-        var draws = new List<MultiMeshInstance3D>();
+        var draws = built ? old.Draws : [];
         // Each the colour of the ground under it, where its material takes its colour from it (a
         // standard one using its vertex colour, or one marked ground_colour, as
         // a grass material is): the colour the ground gives there.
         var coloured = parts.Meshes.Any(m => m.Material is BaseMaterial3D { VertexColorUseAsAlbedo: true }
             || m.Material?.GetMeta("ground_colour", false).AsBool() == true);
         var colours = coloured ? here.Select(p => GroundColourAt(p.Origin)).ToList() : null;
-        foreach (var (mesh, material, at) in parts.Meshes)
+        for (var d = 0; d < parts.Meshes.Count; d++)
         {
-            var multi = new MultiMesh { TransformFormat = MultiMesh.TransformFormatEnum.Transform3D, UseColors = coloured, Mesh = mesh, InstanceCount = here.Count };
+            var (mesh, material, at) = parts.Meshes[d];
+            var multi = built ? draws[d].Multimesh : new MultiMesh { TransformFormat = MultiMesh.TransformFormatEnum.Transform3D, UseColors = coloured, Mesh = mesh };
+            multi.InstanceCount = here.Count;
             for (var i = 0; i < here.Count; i++)
             {
                 multi.SetInstanceTransform(i, toLocal * here[i] * at);
@@ -183,18 +180,25 @@ public partial class FoliageField : Node3D
                     multi.SetInstanceColor(i, colours[i]);
             }
 
+            if (built)
+                continue;
             var draw = new MultiMeshInstance3D { Name = BuiltName, Multimesh = multi, MaterialOverride = material };
             AddChild(draw, true, InternalMode.Back);
             draws.Add(draw);
         }
 
         // Solid as its scene is: a body (at its place in the world) with its shapes at each of its places.
-        StaticBody3D? body = null;
-        if (parts.Shapes.Count > 0)
+        var body = built ? old.Body : null;
+        if (!built && parts.Shapes.Count > 0)
         {
             body = new StaticBody3D { Name = BuiltName + "Body" };
             AddChild(body, true, InternalMode.Back);
             body.GlobalTransform = Transform3D.Identity;
+        }
+
+        if (body is not null)
+        {
+            PhysicsServer3D.BodyClearShapes(body.GetRid());
             foreach (var place in here)
             {
                 foreach (var (shape, at) in parts.Shapes)
@@ -532,8 +536,10 @@ public partial class FoliageField : Node3D
             var myCrown = Crown(key);
 
             var wanted = (int)MathF.Round(area * type.Density / 100f * density) - mine;
-            for (var attempt = 0; wanted > 0 && attempt < wanted * 8; attempt++)
+            var misses = 0;
+            for (var attempt = 0; wanted > 0 && attempt < wanted * 8 && misses < GiveUpAfter; attempt++)
             {
+                misses++;
                 var angle = random.NextSingle() * MathF.Tau;
                 var reach = radius * MathF.Sqrt(random.NextSingle());
                 var at = centre + new Vector3(MathF.Cos(angle) * reach, 0f, MathF.Sin(angle) * reach);
@@ -550,6 +556,7 @@ public partial class FoliageField : Node3D
                 basis = basis.Scaled(Vector3.One * scale);
                 places.Add(new Transform3D(basis, at));
                 near.Add((at, half, false));
+                misses = 0;
                 touched.Add((key, Chunk(places[^1]).X, Chunk(places[^1]).Z));
                 wanted--;
             }
@@ -558,6 +565,9 @@ public partial class FoliageField : Node3D
         foreach (var (key, x, z) in touched)
             BuildChunk(key, x, z);
     }
+
+    /// <summary>How many tries in a row may fail before a touch of the brush stops trying: the area is as full as it can get, or nothing may go there.</summary>
+    private const int GiveUpAfter = 64;
 
     /// <summary>Takes away those of these types (or of any) within a circle.</summary>
     public void Erase(Vector3 centre, float radius, IReadOnlyList<FoliageType>? types)
