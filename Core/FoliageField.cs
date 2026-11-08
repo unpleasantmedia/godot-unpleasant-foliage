@@ -52,11 +52,33 @@ public partial class FoliageField : Node3D
     /// <summary>How far across each stretch of ground its foliage is drawn and made solid in, in metres.</summary>
     public const float ChunkSize = 32f;
 
+    /// <summary>
+    /// The same for trees: bigger, as a forest has few trees to a stretch, and each stretch of each
+    /// tree is a draw of its own (one for each of its meshes, again for each of the sun's shadow
+    /// cascades): in 32-metre stretches a forest in view took thousands of draws.
+    /// </summary>
+    public const float TreeChunkSize = 128f;
+
     /// <summary>Each type's places, by its file, as built.</summary>
     private readonly Dictionary<string, List<Transform3D>> _placed = [];
 
     /// <summary>What each stretch of each type is built as: its draws and its body.</summary>
     private readonly Dictionary<(string Type, int X, int Z), (List<MultiMeshInstance3D> Draws, StaticBody3D? Body)> _chunks = [];
+
+    /// <summary>The group of its draws, for a game's view distance setting to find.</summary>
+    public const string ViewDistanceGroup = "FoliageViewDistance";
+
+    /// <summary>In a game, how far off foliage is drawn, in metres, as its player set it; 0 for as far as can be seen.</summary>
+    public static float ViewDistance { get; set; }
+
+    /// <summary>The group of trees' draws, drawn to the tree distance.</summary>
+    public const string TreeGroup = "TreeViewDistance";
+
+    /// <summary>In a game, how far off trees are drawn, as its player set it; 0 for as far as can be seen.</summary>
+    public static float TreeDistance { get; set; }
+
+    /// <summary>How tall a piece of foliage is, at least, to be a tree, in metres.</summary>
+    private const float TallHeight = 2f;
 
     private readonly Dictionary<string, (List<(Mesh Mesh, Material? Material, Transform3D At)> Meshes, List<(Shape3D Shape, Transform3D At)> Shapes)> _parts = [];
     private bool _rebuildQueued;
@@ -73,6 +95,42 @@ public partial class FoliageField : Node3D
     }
 
     public override void _ExitTree() => Clear();
+
+    /// <summary>
+    /// How near the camera trees cast shadows, in metres, in a game: further off, theirs are too small
+    /// to make out, while each stretch of trees casting them is a draw again for every cascade of the sun's.
+    /// </summary>
+    public const float TreeShadowDistance = 150f;
+
+    /// <summary>How often the trees' shadows are looked over as the camera moves, in seconds.</summary>
+    private const double ShadowCheckEvery = 0.25;
+
+    private double _shadowCheck;
+
+    public override void _Process(double delta)
+    {
+        if (Engine.IsEditorHint() || _tall.Count == 0 || (_shadowCheck -= delta) > 0)
+            return;
+        _shadowCheck = ShadowCheckEvery;
+        if (GetViewport()?.GetCamera3D() is not { } camera)
+            return;
+        var at = camera.GlobalPosition;
+        foreach (var ((key, x, z), (draws, _)) in _chunks)
+        {
+            if (!_tall.Contains(key))
+                continue;
+            // How far off the nearest part of its stretch is, across the ground.
+            var nearX = Mathf.Clamp(at.X, x * TreeChunkSize, (x + 1) * TreeChunkSize);
+            var nearZ = Mathf.Clamp(at.Z, z * TreeChunkSize, (z + 1) * TreeChunkSize);
+            var near = new Vector2(at.X - nearX, at.Z - nearZ).Length() <= TreeShadowDistance;
+            var cast = near ? GeometryInstance3D.ShadowCastingSetting.On : GeometryInstance3D.ShadowCastingSetting.Off;
+            foreach (var draw in draws)
+            {
+                if (draw.CastShadow != cast)
+                    draw.CastShadow = cast;
+            }
+        }
+    }
 
     /// <summary>The group every field in the tree is in.</summary>
     public const string Group = "foliage_fields";
@@ -117,13 +175,17 @@ public partial class FoliageField : Node3D
         {
             var key = Key(type);
             _parts[key] = type.Parts();
+            if (_parts[key].Meshes.Any(m => m.Mesh.GetAabb().Size.Y > TallHeight))
+                _tall.Add(key);
+            else
+                _tall.Remove(key);
             _typesByKey[key] = type;
             _placed[key] = _data.Placed.TryGetValue(key, out var numbers) ? Unpack(numbers) : [];
             // On the ground as it is now, wherever it was when painted.
             var places = _placed[key];
             for (var i = 0; i < places.Count; i++)
                 places[i] = OnGround(places[i], type);
-            foreach (var (X, Z) in _placed[key].Select(Chunk).Distinct().ToList())
+            foreach (var (X, Z) in _placed[key].Select(t => Chunk(key, t)).Distinct().ToList())
                 BuildChunk(key, X, Z);
         }
     }
@@ -141,10 +203,21 @@ public partial class FoliageField : Node3D
         _chunks.Clear();
     }
 
+    /// <summary>How many nodes it has built: each named with its count, so no two are alike.</summary>
+    private int _built;
+
     /// <summary>What the nodes it builds are called, to tell them from anything else under it.</summary>
     private const string BuiltName = "Foliage";
 
-    private static (int X, int Z) Chunk(Transform3D at) => ((int)MathF.Floor(at.Origin.X / ChunkSize), (int)MathF.Floor(at.Origin.Z / ChunkSize));
+    /// <summary>Which stretch of ground a place of a type is in: trees' stretches are bigger (see <see cref="TreeChunkSize"/>).</summary>
+    private (int X, int Z) Chunk(string key, Transform3D at)
+    {
+        var size = _tall.Contains(key) ? TreeChunkSize : ChunkSize;
+        return ((int)MathF.Floor(at.Origin.X / size), (int)MathF.Floor(at.Origin.Z / size));
+    }
+
+    /// <summary>The types that are trees (a part taller than <see cref="TallHeight"/>).</summary>
+    private readonly HashSet<string> _tall = [];
 
     /// <summary>
     /// Builds one stretch of one type again, from its places there: in the nodes it already has, if it
@@ -154,7 +227,7 @@ public partial class FoliageField : Node3D
     {
         if (!_placed.TryGetValue(key, out var all) || !_parts.TryGetValue(key, out var parts))
             return;
-        var here = all.Where(t => Chunk(t) == (x, z) && !Masked(t.Origin)).ToList();
+        var here = all.Where(t => Chunk(key, t) == (x, z) && !Masked(t.Origin)).ToList();
         var built = _chunks.TryGetValue((key, x, z), out var old);
         if (here.Count == 0 && !built)
             return;
@@ -183,7 +256,18 @@ public partial class FoliageField : Node3D
             if (built)
                 continue;
             var draw = new MultiMeshInstance3D { Name = BuiltName, Multimesh = multi, MaterialOverride = material };
-            AddChild(draw, true, InternalMode.Back);
+            // A name of its own (not one Godot makes unique by trying Foliage2, Foliage3, ... against
+            // thousands of others, which took seconds as a big level loaded).
+            draw.Name = $"{BuiltName}{++_built}";
+            AddChild(draw, false, InternalMode.Back);
+            // In a game, drawn no further off than its player set: trees to the tree distance, smaller
+            // foliage to the foliage distance.
+            var tall = mesh.GetAabb().Size.Y > TallHeight;
+            var distance = tall ? TreeDistance : ViewDistance;
+            if (!Engine.IsEditorHint() && distance > 0f)
+                draw.VisibilityRangeEnd = distance;
+            draw.AddToGroup(tall ? TreeGroup : ViewDistanceGroup);
+
             draws.Add(draw);
         }
 
@@ -191,8 +275,8 @@ public partial class FoliageField : Node3D
         var body = built ? old.Body : null;
         if (!built && parts.Shapes.Count > 0)
         {
-            body = new StaticBody3D { Name = BuiltName + "Body" };
-            AddChild(body, true, InternalMode.Back);
+            body = new StaticBody3D { Name = $"{BuiltName}Body{++_built}" };
+            AddChild(body, false, InternalMode.Back);
             body.GlobalTransform = Transform3D.Identity;
         }
 
@@ -301,7 +385,7 @@ public partial class FoliageField : Node3D
         foreach (var (key, places) in _placed)
         {
             foreach (var place in places.Where(p => Inside(p.Origin)))
-                touched.Add((key, Chunk(place).X, Chunk(place).Z));
+                touched.Add((key, Chunk(key, place).X, Chunk(key, place).Z));
         }
 
         foreach (var (key, x, z) in touched)
@@ -441,7 +525,7 @@ public partial class FoliageField : Node3D
                 if (moved.Origin.Y == at.Y)
                     continue;
                 places[i] = moved;
-                touched.Add(Chunk(moved));
+                touched.Add(Chunk(key, moved));
             }
 
             foreach (var (x, z) in touched)
@@ -454,7 +538,7 @@ public partial class FoliageField : Node3D
     {
         if (!_chunks.TryGetValue((key, x, z), out var built) || !_parts.TryGetValue(key, out var parts))
             return;
-        var here = _placed[key].Where(t => Chunk(t) == (x, z) && !Masked(t.Origin)).ToList();
+        var here = _placed[key].Where(t => Chunk(key, t) == (x, z) && !Masked(t.Origin)).ToList();
         var toLocal = GlobalTransform.AffineInverse();
         for (var d = 0; d < built.Draws.Count && d < parts.Meshes.Count; d++)
         {
@@ -512,6 +596,10 @@ public partial class FoliageField : Node3D
             {
                 _placed[key] = places = [];
                 _parts[key] = type.Parts();
+                if (_parts[key].Meshes.Any(m => m.Mesh.GetAabb().Size.Y > TallHeight))
+                    _tall.Add(key);
+                else
+                    _tall.Remove(key);
             }
 
             _typesByKey[key] = type;
@@ -557,7 +645,7 @@ public partial class FoliageField : Node3D
                 places.Add(new Transform3D(basis, at));
                 near.Add((at, half, false));
                 misses = 0;
-                touched.Add((key, Chunk(places[^1]).X, Chunk(places[^1]).Z));
+                touched.Add((key, Chunk(key, places[^1]).X, Chunk(key, places[^1]).Z));
                 wanted--;
             }
         }
@@ -581,7 +669,7 @@ public partial class FoliageField : Node3D
             if (gone.Count == 0)
                 continue;
             places.RemoveAll(p => Flat(p.Origin - centre) <= radius && !Masked(p.Origin));
-            foreach (var (X, Z) in gone.Select(Chunk).Distinct())
+            foreach (var (X, Z) in gone.Select(t => Chunk(key, t)).Distinct())
                 BuildChunk(key, X, Z);
         }
     }
@@ -630,7 +718,7 @@ public partial class FoliageField : Node3D
     public void Restore(Godot.Collections.Dictionary<string, float[]> snapshot)
     {
         EnsureData();
-        _data!.Placed = snapshot.Duplicate();
+        _data!.Placed = WithOwn(snapshot);
         Save();
         Rebuild();
     }
@@ -639,8 +727,27 @@ public partial class FoliageField : Node3D
     public void Commit()
     {
         EnsureData();
-        _data!.Placed = Snapshot();
+        _data!.Placed = WithOwn(Snapshot());
         Save();
+    }
+
+    /// <summary>
+    /// The data file's places with its own types' as given, every other type's kept as they are: other
+    /// fields can keep theirs in the same file, and writing this one's must not take theirs away.
+    /// </summary>
+    private Godot.Collections.Dictionary<string, float[]> WithOwn(Godot.Collections.Dictionary<string, float[]> own)
+    {
+        var mine = _types.Where(t => t is not null).Select(Key).Concat(_placed.Keys).ToHashSet();
+        var placed = new Godot.Collections.Dictionary<string, float[]>();
+        foreach (var (key, numbers) in _data!.Placed)
+        {
+            if (!mine.Contains(key))
+                placed[key] = numbers;
+        }
+
+        foreach (var (key, numbers) in own)
+            placed[key] = numbers;
+        return placed;
     }
 
     private void Save()
