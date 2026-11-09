@@ -6,8 +6,10 @@ using Godot;
 namespace UnpleasantMedia.UnpleasantFoliage;
 
 /// <summary>
-/// Foliage painted over a level's ground (with the Foliage plugin's brush): for each of its
-/// <see cref="Types"/>, the places painted, kept in <see cref="Data"/> (a file of its own). Each
+/// Foliage painted over a level's ground (with the Foliage plugin's brush) from its
+/// <see cref="Library"/>: for each type painted, the places painted, kept in <see cref="Data"/>
+/// (a file of its own, one to a field: a field draws every type of its library that its data has
+/// places for). Each
 /// type's meshes are drawn at its places, many to a draw (a MultiMesh per mesh, per stretch of
 /// ground <see cref="ChunkSize"/> across, so those out of sight are left out), and its collision
 /// shapes are put there too, in a static body per stretch.
@@ -17,19 +19,43 @@ namespace UnpleasantMedia.UnpleasantFoliage;
 [Icon("res://addons/unpleasant_foliage/Icons/Foliage.svg")]
 public partial class FoliageField : Node3D
 {
-    /// <summary>The kinds of foliage it has to paint with.</summary>
+    /// <summary>
+    /// The library it is painted from (see <see cref="FoliageLibrary"/>); if not set, the project's
+    /// (Project Settings &gt; Unpleasant Foliage &gt; Library).
+    /// </summary>
     [Export]
-    public Godot.Collections.Array<FoliageType> Types
+    public FoliageLibrary? Library
     {
-        get => _types;
+        get => _library;
         set
         {
-            _types = value ?? [];
+            _library = value;
             QueueRebuild();
         }
     }
 
+    private FoliageLibrary? _library;
+
+    /// <summary>The library it is painted from: its own, or the project's.</summary>
+    public FoliageLibrary? UsedLibrary => Library ?? FoliageLibrary.ProjectLibrary();
+
+    /// <summary>
+    /// The kinds of foliage it has: those of its library its data has places for, found as it is
+    /// built; and those painted here since (see <see cref="Adopt"/>).
+    /// </summary>
     private Godot.Collections.Array<FoliageType> _types = [];
+
+    /// <summary>
+    /// A type painted here for the first time taken into the kinds it has, without building it all
+    /// again (painting builds what it puts down itself). False if it had it already.
+    /// </summary>
+    public bool Adopt(FoliageType type)
+    {
+        if (_types.Contains(type))
+            return false;
+        _types.Add(type);
+        return true;
+    }
 
     /// <summary>Where its foliage is: made beside the level the first time something is painted.</summary>
     [Export]
@@ -171,6 +197,9 @@ public partial class FoliageField : Node3D
         _parts.Clear();
         if (_data is null)
             return;
+        // Every type of its library its data has places for (what it has of types no longer in the
+        // library is kept in the data, but not drawn).
+        _types = [.. UsedLibrary?.Types.Where(t => t is not null && _data.Placed.ContainsKey(Key(t))) ?? []];
         foreach (var type in _types.Where(t => t is not null))
         {
             var key = Key(type);
@@ -418,6 +447,32 @@ public partial class FoliageField : Node3D
         }
 
         return inside;
+    }
+
+    // ---- Clearing ------------------------------------------------------------------------------
+
+    [ExportToolButton("Clear", Icon = "Clear")]
+    public Callable ClearButton => new(this, MethodName.ClearAll);
+
+    /// <summary>Takes away everything painted in it. One step to undo.</summary>
+    public void ClearAll()
+    {
+        var before = Snapshot();
+        if (before.Count == 0)
+            return;
+        var after = new Godot.Collections.Dictionary<string, float[]>();
+#if TOOLS
+        if (Engine.IsEditorHint())
+        {
+            var undo = EditorInterface.Singleton.GetEditorUndoRedo();
+            undo.CreateAction($"Clear {base.Name}");
+            undo.AddDoMethod(this, MethodName.Restore, after);
+            undo.AddUndoMethod(this, MethodName.Restore, before);
+            undo.CommitAction();
+            return;
+        }
+#endif
+        Restore(after);
     }
 
     // ---- Thinning out trees ----------------------------------------------------------------
@@ -766,7 +821,8 @@ public partial class FoliageField : Node3D
         if (!string.IsNullOrEmpty(level))
         {
             var folder = FoliageGround.DataFolder ?? level.GetBaseDir();
-            var path = folder.PathJoin(level.GetFile().GetBaseName() + "-Foliage.res");
+            // Its own: a field draws all its data holds, so no two may share one.
+            var path = folder.PathJoin($"{level.GetFile().GetBaseName()}-{System.Text.RegularExpressions.Regex.Replace(base.Name.ToString(), @"[^A-Za-z0-9_-]+", "-")}-Foliage.res");
             DirAccess.MakeDirRecursiveAbsolute(folder);
             ResourceSaver.Save(_data, path);
             _data = ResourceLoader.Load<FoliageData>(path);

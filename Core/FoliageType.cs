@@ -27,6 +27,23 @@ public partial class FoliageType : Resource
 
     private string _name = "";
 
+    /// <summary>Which section of the Foliage dock it is in (Trees, Grass, ...); with none, Other.</summary>
+    [Export]
+    public string Category
+    {
+        get => _category;
+        set
+        {
+            _category = value;
+            EmitChanged();
+        }
+    }
+
+    private string _category = "";
+
+    /// <summary>The section it is listed under: its category, or Other.</summary>
+    public string Section => string.IsNullOrWhiteSpace(_category) ? "Other" : _category.Trim();
+
     /// <summary>What it looks like: its meshes and collision shapes are used, nothing else in it.</summary>
     [Export]
     public PackedScene? Scene { get; set; }

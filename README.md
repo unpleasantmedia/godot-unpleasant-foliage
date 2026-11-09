@@ -56,10 +56,12 @@ Set `FoliageGround.DataFolder` to choose where new data files go. By default the
 
 ## Use
 
-1. Make a scene for each kind of foliage, and a `FoliageType` resource for it.
-2. Add a `FoliageField` to your level and add the types to its **Types**.
-3. Select the field, pick types in the **Foliage** dock, and choose **Paint** or **Erase** in the 3D view's toolbar.
+1. Make a scene for each kind of foliage, and a `FoliageType` resource for it. Give it a **Category** (Trees, Grass, ...) to group it in the dock.
+2. Make a `FoliageLibrary` and add the types to its **Types**. Set it as the project's library under **Project > Project Settings > Unpleasant Foliage > Library**, or give a single field its own in its **Library**.
+3. Add a `FoliageField` to your level, select it, pick types in the **Foliage** dock (a section per category), and choose **Paint** or **Erase** in the 3D view's toolbar.
 4. Drag on the ground. Ctrl-drag erases whichever tool is on. With **All** ticked, Erase takes away every type.
+
+A field draws every type of its library that its data has places for. Each field has a data file of its own, made the first time you paint and named after the level and the field; don't give two fields the same data file, or each will draw the other's foliage too.
 
 A type's **Name** is what the dock and the field's list show. Its **Allowed Textures** are ticked from the ground of the selected field, or of the first field in the open scene. A type is only painted where nothing but ticked textures shows, so in a fade it only goes between two ticked textures; with none ticked it can go anywhere. Foliage that's already painted stays where it is.
 

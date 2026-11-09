@@ -8,7 +8,8 @@ namespace UnpleasantMedia.UnpleasantFoliage.Editor;
 
 /// <summary>
 /// Paints foliage in the 3D editor. With a <see cref="FoliageField"/> selected, the Foliage dock
-/// lists its types (with thumbnails) to pick which to paint or take away, and the viewport's
+/// lists the types of its library (or the project's), a section for each category, with
+/// thumbnails, to pick which to paint or take away, and the viewport's
 /// toolbar has the tools: Paint or Erase, how big the brush is, and how thick to paint. Drag on the
 /// ground to paint (or erase); ctrl-drag erases whatever the tool. Each stroke is one step to undo.
 /// </summary>
@@ -22,8 +23,17 @@ public partial class FoliagePlugin : EditorPlugin
     private SpinBox? _density;
     private CheckBox? _eraseAll;
     private VBoxContainer? _dock;
-    private ItemList? _list;
     private Label? _hint;
+
+    /// <summary>The categories, one after another: a heading and a list of its types, each with a thumbnail and its name under it.</summary>
+    private VBoxContainer? _sections;
+    private readonly List<ItemList> _lists = [];
+
+    /// <summary>The types shown, by the number each list item holds.</summary>
+    private readonly List<FoliageType> _shown = [];
+
+    /// <summary>The library shown, watched for changes (to it, or to its types).</summary>
+    private FoliageLibrary? _library;
 
     private FoliageField? _field;
     private FoliageTypeInspector? _inspector;
@@ -66,27 +76,63 @@ public partial class FoliagePlugin : EditorPlugin
         _inspector = new FoliageTypeInspector();
         AddInspectorPlugin(_inspector);
 
+        AddLibrarySetting();
         _dock = new VBoxContainer { Name = "Foliage" };
         _hint = new Label { Text = "Select a FoliageField to paint with its types.", AutowrapMode = TextServer.AutowrapMode.WordSmart };
         _dock.AddChild(_hint);
-        _list = new ItemList
-        {
-            SelectMode = ItemList.SelectModeEnum.Multi, MaxColumns = 0, SameColumnWidth = true, IconMode = ItemList.IconModeEnum.Top,
-            FixedIconSize = new Vector2I(96, 96), FixedColumnWidth = 110, SizeFlagsVertical = Control.SizeFlags.ExpandFill,
-            TooltipText = "The selected FoliageField's types. Ctrl- or shift-click to pick several: painting scatters all of them.",
-        };
-        _dock.AddChild(_list);
+        var scroll = new ScrollContainer { HorizontalScrollMode = ScrollContainer.ScrollMode.Disabled, SizeFlagsVertical = Control.SizeFlags.ExpandFill };
+        _sections = new VBoxContainer { SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
+        scroll.AddChild(_sections);
+        _dock.AddChild(scroll);
+        ProjectSettings.Singleton.Connect(ProjectSettings.SignalName.SettingsChanged, new Callable(this, MethodName.ShowTypes));
         // Below the Inspector, so both show while the field is being edited.
         // In its slot only while the plugin is shown: see _MakeVisible.
         EditorInterface.Singleton.GetInspector().Connect(EditorInspector.SignalName.PropertyEdited, new Callable(this, MethodName.PropertyEdited));
     }
 
-    // Its types changed in the Inspector: listed again.
+    // Its library changed in the Inspector: listed again.
     private void PropertyEdited(string property)
     {
-        if (_field is not null && property == FoliageField.PropertyName.Types.ToString())
+        if (_field is not null && property == FoliageField.PropertyName.Library.ToString())
             ShowTypes();
     }
+
+    /// <summary>The project's library setting, shown in Project Settings (without Advanced Settings on), picked as a file.</summary>
+    private static void AddLibrarySetting()
+    {
+        if (!ProjectSettings.HasSetting(FoliageLibrary.Setting))
+            ProjectSettings.SetSetting(FoliageLibrary.Setting, "");
+        ProjectSettings.SetInitialValue(FoliageLibrary.Setting, "");
+        ProjectSettings.SetAsBasic(FoliageLibrary.Setting, true);
+        ProjectSettings.AddPropertyInfo(new Godot.Collections.Dictionary
+        {
+            ["name"] = FoliageLibrary.Setting,
+            ["type"] = (int)Variant.Type.String,
+            ["hint"] = (int)PropertyHint.File,
+            ["hint_string"] = "*.tres,*.res",
+        });
+    }
+
+    /// <summary>Follows changes to a library and its types (renamed, recategorised, added), letting go of the one before.</summary>
+    private void Watch(FoliageLibrary? library)
+    {
+        var refill = new Callable(this, MethodName.ShowTypes);
+        foreach (var resource in Watched(_library))
+        {
+            if (resource.IsConnected(Resource.SignalName.Changed, refill))
+                resource.Disconnect(Resource.SignalName.Changed, refill);
+        }
+
+        _library = library;
+        foreach (var resource in Watched(_library))
+        {
+            if (!resource.IsConnected(Resource.SignalName.Changed, refill))
+                resource.Connect(Resource.SignalName.Changed, refill);
+        }
+    }
+
+    private static IEnumerable<Resource> Watched(FoliageLibrary? library) =>
+        library is null ? [] : library.Types.OfType<Resource>().Prepend(library);
 
     public override void _ExitTree()
     {
@@ -100,6 +146,7 @@ public partial class FoliagePlugin : EditorPlugin
             _toolbar.QueueFree();
         }
 
+        Watch(null);
         PluginDocks.Remove(this, _dock);
         if (_inspector is not null)
             RemoveInspectorPlugin(_inspector);
@@ -140,56 +187,83 @@ public partial class FoliagePlugin : EditorPlugin
         }
     }
 
-    /// <summary>The field's types in the dock, each with a thumbnail of its scene once one is made.</summary>
+    /// <summary>
+    /// The library's types in the dock, a section for each category, each with a thumbnail of its
+    /// scene once one is made; those picked before still picked.
+    /// </summary>
     private void ShowTypes()
     {
-        if (_list is null)
+        if (_sections is null || !IsInstanceValid(_sections))
             return;
         var picked = Picked().ToHashSet();
-        _list.Clear();
+        foreach (var old in _sections.GetChildren())
+        {
+            _sections.RemoveChild(old);
+            old.QueueFree();
+        }
+
+        _lists.Clear();
+        _shown.Clear();
+        var library = _field is not null && IsInstanceValid(_field) ? _field.UsedLibrary : null;
+        Watch(library);
         if (_hint is not null)
             _hint.Text = _field is null ? "Select a FoliageField to paint with its types."
-                : _field.Types.Count == 0 ? "Add FoliageTypes to the field's Types in the Inspector."
-                : "Pick what to paint or erase:";
-        if (_field is null)
+                : library is null ? "Give the FoliageField a Library, or set the project's in Project Settings > Unpleasant Foliage > Library."
+                : library.Types.Count == 0 ? "Add FoliageTypes to the library's Types."
+                : "Pick what to paint or erase (ctrl- or shift-click for several):";
+        if (library is null)
             return;
-        var types = _field.Types;
-        for (var i = 0; i < types.Count; i++)
+
+        foreach (var section in library.Types.Where(t => t is not null).GroupBy(t => t.Section).OrderBy(g => g.Key == "Other").ThenBy(g => g.Key))
         {
-            var type = types[i];
-            if (type is null)
-                continue;
-            // By method name, as for the buttons. So a type renamed shows at once.
-            var renamed = new Callable(this, MethodName.ShowTypes);
-            if (!type.IsConnected(Resource.SignalName.Changed, renamed))
-                type.Connect(Resource.SignalName.Changed, renamed);
-            var name = FoliageField.Name(type);
-            var index = _list.AddItem(name);
-            _list.SetItemMetadata(index, i);
-            if (picked.Contains(type))
-                _list.Select(index, false);
-            // A thumbnail of its first mesh: scenes only have one when saved in the editor.
-            if (type.Parts().Meshes.FirstOrDefault() is { Mesh: { } mesh })
-                EditorInterface.Singleton.GetResourcePreviewer().QueueEditedResourcePreview(mesh, this, MethodName.Previewed, index);
+            _sections.AddChild(new Label { Text = section.Key, ThemeTypeVariation = "HeaderSmall" });
+            var list = new ItemList
+            {
+                SelectMode = ItemList.SelectModeEnum.Multi, MaxColumns = 0, SameColumnWidth = true, IconMode = ItemList.IconModeEnum.Top,
+                FixedIconSize = new Vector2I(96, 96), FixedColumnWidth = 110, AutoHeight = true, SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
+                TooltipText = "Ctrl- or shift-click to pick several: painting scatters all of them.",
+            };
+            _sections.AddChild(list);
+            _lists.Add(list);
+            foreach (var type in section.OrderBy(FoliageField.Name))
+            {
+                var index = list.AddItem(FoliageField.Name(type));
+                list.SetItemMetadata(index, _shown.Count);
+                _shown.Add(type);
+                if (picked.Contains(type))
+                    list.Select(index, false);
+                // A thumbnail of its first mesh: scenes only have one when saved in the editor.
+                if (type.Parts().Meshes.FirstOrDefault() is { Mesh: { } mesh })
+                    EditorInterface.Singleton.GetResourcePreviewer().QueueEditedResourcePreview(mesh, this, MethodName.Previewed, _shown.Count - 1);
+            }
         }
     }
 
-    private void Previewed(string path, Texture2D? preview, Texture2D? thumbnail, Variant index)
+    private void Previewed(string path, Texture2D? preview, Texture2D? thumbnail, int shown)
     {
-        if (_list is not null && preview is not null && index.AsInt32() < _list.ItemCount)
-            _list.SetItemIcon(index.AsInt32(), preview);
+        if (preview is null)
+            return;
+        foreach (var list in _lists.Where(IsInstanceValid))
+        {
+            for (var i = 0; i < list.ItemCount; i++)
+            {
+                if (list.GetItemMetadata(i).AsInt32() == shown)
+                    list.SetItemIcon(i, preview);
+            }
+        }
     }
 
-    /// <summary>The types picked in the dock.</summary>
+    /// <summary>The types picked in the dock, in any section.</summary>
     private IEnumerable<FoliageType> Picked()
     {
-        if (_list is null || _field is null)
-            yield break;
-        foreach (var index in _list.GetSelectedItems())
+        foreach (var list in _lists.Where(IsInstanceValid))
         {
-            var at = _list.GetItemMetadata(index).AsInt32();
-            if (at >= 0 && at < _field.Types.Count && _field.Types[at] is { } type)
-                yield return type;
+            foreach (var index in list.GetSelectedItems())
+            {
+                var at = list.GetItemMetadata(index).AsInt32();
+                if (at >= 0 && at < _shown.Count)
+                    yield return _shown[at];
+            }
         }
     }
 
@@ -245,9 +319,15 @@ public partial class FoliagePlugin : EditorPlugin
         var radius = (float)_radius!.Value;
         var picked = Picked().ToList();
         if (_erasing)
+        {
             _field.Erase(at, radius, _eraseAll!.ButtonPressed ? null : picked);
-        else
-            _field.Paint(at, radius, picked, (float)_density!.Value, _random);
+            return;
+        }
+
+        // Painted here for the first time: taken into the field's types (the scene changed with it).
+        if (picked.Count(_field.Adopt) > 0)
+            EditorInterface.Singleton.MarkSceneAsUnsaved();
+        _field.Paint(at, radius, picked, (float)_density!.Value, _random);
     }
 
     /// <summary>The stroke done: written to the field's data, and one step to undo.</summary>
