@@ -118,7 +118,12 @@ public partial class FoliageField : Node3D
     {
         AddToGroup(Group);
         QueueRebuild();
+        OutlineOnEnter();
+        Entered?.Invoke(this);
     }
+
+    /// <summary>A field come into the tree: for whatever sets masks on fields to set its own on this one too.</summary>
+    public static event Action<FoliageField>? Entered;
 
     public override void _ExitTree() => Clear();
 
@@ -128,6 +133,20 @@ public partial class FoliageField : Node3D
     /// </summary>
     public const float TreeShadowDistance = 150f;
 
+    /// <summary>How far off foliage is drawn in the editor, in metres: trees, and the rest.</summary>
+    public const float EditorTreeDistance = 800f;
+    public const float EditorViewDistance = 150f;
+
+    /// <summary>The camera of the editor's first 3D view, or null outside the editor.</summary>
+    private static Camera3D? EditorCamera()
+    {
+#if TOOLS
+        return EditorInterface.Singleton.GetEditorViewport3D(0)?.GetCamera3D();
+#else
+        return null;
+#endif
+    }
+
     /// <summary>How often the trees' shadows are looked over as the camera moves, in seconds.</summary>
     private const double ShadowCheckEvery = 0.25;
 
@@ -135,10 +154,12 @@ public partial class FoliageField : Node3D
 
     public override void _Process(double delta)
     {
-        if (Engine.IsEditorHint() || _tall.Count == 0 || (_shadowCheck -= delta) > 0)
+        if (_tall.Count == 0 || (_shadowCheck -= delta) > 0)
             return;
         _shadowCheck = ShadowCheckEvery;
-        if (GetViewport()?.GetCamera3D() is not { } camera)
+        // In the editor, as its 3D view's camera sees it.
+        var camera = Engine.IsEditorHint() ? EditorCamera() : GetViewport()?.GetCamera3D();
+        if (camera is null)
             return;
         var at = camera.GlobalPosition;
         foreach (var ((key, x, z), (draws, _)) in _chunks)
@@ -214,8 +235,10 @@ public partial class FoliageField : Node3D
             var places = _placed[key];
             for (var i = 0; i < places.Count; i++)
                 places[i] = OnGround(places[i], type);
-            foreach (var (X, Z) in _placed[key].Select(t => Chunk(key, t)).Distinct().ToList())
-                BuildChunk(key, X, Z);
+            // Each stretch with its places, sorted out in one go (not every place gone over for each stretch:
+            // with hundreds of thousands of trees, that held up loading a level for minutes).
+            foreach (var stretch in places.GroupBy(t => Chunk(key, t)))
+                BuildChunk(key, stretch.Key.X, stretch.Key.Z, [.. stretch]);
         }
     }
 
@@ -230,6 +253,10 @@ public partial class FoliageField : Node3D
         }
 
         _chunks.Clear();
+        foreach (var body in _bodies.Values)
+            PhysicsServer3D.FreeRid(body);
+        _bodies.Clear();
+        _bodiesChanged.Clear();
     }
 
     /// <summary>How many nodes it has built: each named with its count, so no two are alike.</summary>
@@ -252,11 +279,32 @@ public partial class FoliageField : Node3D
     /// Builds one stretch of one type again, from its places there: in the nodes it already has, if it
     /// has them, as adding and taking away nodes makes the editor go over the whole level again.
     /// </summary>
-    private void BuildChunk(string key, int x, int z)
+    /// <summary>Builds these stretches again, each type's places sorted out by stretch in one go.</summary>
+    private void BuildChunks(IEnumerable<(string Key, int X, int Z)> stretches)
+    {
+        foreach (var byType in stretches.GroupBy(t => t.Key))
+        {
+            if (!_placed.TryGetValue(byType.Key, out var all))
+                continue;
+            var wanted = byType.Select(t => (t.X, t.Z)).ToHashSet();
+            var sorted = wanted.ToDictionary(w => w, _ => new List<Transform3D>());
+            foreach (var place in all)
+            {
+                if (sorted.TryGetValue(Chunk(byType.Key, place), out var list))
+                    list.Add(place);
+            }
+
+            foreach (var ((x, z), here) in sorted)
+                BuildChunk(byType.Key, x, z, here);
+        }
+    }
+
+    private void BuildChunk(string key, int x, int z, List<Transform3D>? those = null)
     {
         if (!_placed.TryGetValue(key, out var all) || !_parts.TryGetValue(key, out var parts))
             return;
-        var here = all.Where(t => Chunk(key, t) == (x, z) && !Masked(t.Origin)).ToList();
+        // Its places: as given (already sorted out by stretch), or found among all of them.
+        var here = (those ?? all.Where(t => Chunk(key, t) == (x, z))).Where(t => !Masked(t.Origin, Height(key, t))).ToList();
         var built = _chunks.TryGetValue((key, x, z), out var old);
         if (here.Count == 0 && !built)
             return;
@@ -293,33 +341,20 @@ public partial class FoliageField : Node3D
             // foliage to the foliage distance.
             var tall = mesh.GetAabb().Size.Y > TallHeight;
             var distance = tall ? TreeDistance : ViewDistance;
-            if (!Engine.IsEditorHint() && distance > 0f)
+            // In the editor, no further than its own distances (or there are hundreds of thousands drawn).
+            if (Engine.IsEditorHint())
+                distance = tall ? EditorTreeDistance : EditorViewDistance;
+            if (distance > 0f)
                 draw.VisibilityRangeEnd = distance;
             draw.AddToGroup(tall ? TreeGroup : ViewDistanceGroup);
 
             draws.Add(draw);
         }
 
-        // Solid as its scene is: a body (at its place in the world) with its shapes at each of its places.
-        var body = built ? old.Body : null;
-        if (!built && parts.Shapes.Count > 0)
-        {
-            body = new StaticBody3D { Name = $"{BuiltName}Body{++_built}" };
-            AddChild(body, false, InternalMode.Back);
-            body.GlobalTransform = Transform3D.Identity;
-        }
-
-        if (body is not null)
-        {
-            PhysicsServer3D.BodyClearShapes(body.GetRid());
-            foreach (var place in here)
-            {
-                foreach (var (shape, at) in parts.Shapes)
-                    PhysicsServer3D.BodyAddShape(body.GetRid(), shape.GetRid(), place * at);
-            }
-        }
-
-        _chunks[(key, x, z)] = (draws, body);
+        // Solid as its scene is: in the body of its square (see BodySize), built again at the end of the frame.
+        if (parts.Shapes.Count > 0)
+            BodyChanged(key, x, z);
+        _chunks[(key, x, z)] = (draws, null);
     }
 
     private static List<Transform3D> Unpack(float[] numbers)
@@ -350,31 +385,24 @@ public partial class FoliageField : Node3D
 
     // ---- Masks ------------------------------------------------------------------------------
 
-    /// <summary>The areas where foliage is hidden, by the name each caller gave: not saved, so a caller sets them each time it loads.</summary>
-    private readonly Dictionary<string, (Vector2[] Outline, Rect2 Bounds)> _masks = [];
+    /// <summary>
+    /// The shapes its foliage is hidden under, by the name each caller gave (see <see cref="FoliageMaskShape"/>):
+    /// not saved, so a caller sets them each time it loads. What they hide is drawn and solid no more,
+    /// but stays in its data (see <see cref="PruneMasked"/>).
+    /// </summary>
+    private readonly FoliageMaskIndex _maskIndex = new();
 
     /// <summary>The areas masks changed in, to build again at the end of the frame.</summary>
     private readonly List<Rect2> _maskChanges = [];
 
-    /// <summary>
-    /// Hides its foliage inside an outline, in world X and Z, until the mask is removed: it is drawn
-    /// and solid no more, but stays in its data. Setting a name again moves that mask.
-    /// </summary>
-    public void SetMask(string name, Vector2[] outline)
-    {
-        if (outline.Length < 3)
-        {
-            RemoveMask(name);
-            return;
-        }
+    /// <summary>Hides its foliage inside an outline, in world X and Z, at any height. Setting a name again moves that mask.</summary>
+    public void SetMask(string name, Vector2[] outline) => SetMasks(name, [new FoliageMaskShape(outline)]);
 
-        var bounds = new Rect2(outline[0], Vector2.Zero);
-        foreach (var point in outline)
-            bounds = bounds.Expand(point);
-        if (_masks.TryGetValue(name, out var old))
-            MaskChanged(old.Bounds);
-        _masks[name] = ([.. outline], bounds);
-        MaskChanged(bounds);
+    /// <summary>Hides its foliage under these shapes, until the name's masks are set again or removed.</summary>
+    public void SetMasks(string name, IReadOnlyList<FoliageMaskShape> shapes)
+    {
+        foreach (var area in _maskIndex.Set(name, shapes))
+            MaskChanged(area);
     }
 
     /// <summary>A mask over a rectangle, in world X and Z.</summary>
@@ -393,8 +421,8 @@ public partial class FoliageField : Node3D
     /// <summary>Takes a mask away: what it hid shows again.</summary>
     public void RemoveMask(string name)
     {
-        if (_masks.Remove(name, out var old))
-            MaskChanged(old.Bounds);
+        foreach (var area in _maskIndex.Remove(name))
+            MaskChanged(area);
     }
 
     private void MaskChanged(Rect2 area)
@@ -404,36 +432,91 @@ public partial class FoliageField : Node3D
         _maskChanges.Add(area);
     }
 
+    /// <summary>How far across the squares changed areas are kept in, to tell quickly whether a place is in one.</summary>
+    private const float ChangeSquare = 32f;
+
     /// <summary>Builds again the stretches masks changed in, each once however many masks were set.</summary>
     private void ApplyMasks()
     {
-        var changes = _maskChanges.ToList();
+        if (!IsInstanceValid(this))
+            return;
+        var changed = new HashSet<(int, int)>();
+        foreach (var area in _maskChanges)
+        {
+            for (var x = (int)MathF.Floor(area.Position.X / ChangeSquare); x <= (int)MathF.Floor(area.End.X / ChangeSquare); x++)
+                for (var z = (int)MathF.Floor(area.Position.Y / ChangeSquare); z <= (int)MathF.Floor(area.End.Y / ChangeSquare); z++)
+                    changed.Add((x, z));
+        }
+
         _maskChanges.Clear();
         var touched = new HashSet<(string Key, int X, int Z)>();
-        bool Inside(Vector3 at) => changes.Any(c => c.HasPoint(new Vector2(at.X, at.Z)) || (at.X == c.End.X || at.Z == c.End.Y) && c.Grow(0.001f).HasPoint(new Vector2(at.X, at.Z)));
         foreach (var (key, places) in _placed)
         {
-            foreach (var place in places.Where(p => Inside(p.Origin)))
-                touched.Add((key, Chunk(key, place).X, Chunk(key, place).Z));
+            foreach (var place in places)
+            {
+                if (changed.Contains(((int)MathF.Floor(place.Origin.X / ChangeSquare), (int)MathF.Floor(place.Origin.Z / ChangeSquare))))
+                    touched.Add((key, Chunk(key, place).X, Chunk(key, place).Z));
+            }
         }
 
-        foreach (var (key, x, z) in touched)
-            BuildChunk(key, x, z);
+        BuildChunks(touched);
     }
 
-    /// <summary>Whether a place is under a mask.</summary>
-    private bool Masked(Vector3 at)
-    {
-        if (_masks.Count == 0)
-            return false;
-        var point = new Vector2(at.X, at.Z);
-        foreach (var (outline, bounds) in _masks.Values)
-        {
-            if (point.X >= bounds.Position.X && point.Y >= bounds.Position.Y && point.X <= bounds.End.X && point.Y <= bounds.End.Y && InOutline(outline, point))
-                return true;
-        }
+    /// <summary>Whether foliage at a place, this tall, is under a mask.</summary>
+    private bool Masked(Vector3 at, float height = 0f) => !_maskIndex.IsEmpty && _maskIndex.Covers(at, height, buffers: KeepBuffers);
 
-        return false;
+    /// <summary>
+    /// Whether buffers (along roads, say: see FoliageMaskShape) keep foliage off, hidden and painted
+    /// round: set by the Foliage dock. Changed, every field is built again.
+    /// </summary>
+    public static bool KeepBuffers
+    {
+        get => _keepBuffers;
+        set
+        {
+            if (_keepBuffers == value)
+                return;
+            _keepBuffers = value;
+            if (Engine.GetMainLoop() is SceneTree tree)
+            {
+                foreach (var field in InTree(tree))
+                    field.QueueRebuild();
+            }
+        }
+    }
+
+    private static bool _keepBuffers = true;
+
+    /// <summary>How tall a type's foliage is at full size: the top of its meshes, from its foot.</summary>
+    private float TypeHeight(string key)
+    {
+        if (_heights.TryGetValue(key, out var height))
+            return height;
+        height = 0f;
+        foreach (var (mesh, _, at) in _parts.TryGetValue(key, out var parts) ? parts.Meshes : [])
+            height = MathF.Max(height, (at * mesh.GetAabb()).End.Y);
+        return _heights[key] = height;
+    }
+
+    private readonly Dictionary<string, float> _heights = [];
+
+    /// <summary>How tall one place's foliage is.</summary>
+    private float Height(string key, Transform3D place) => TypeHeight(key) * Size(place);
+
+    /// <summary>
+    /// Takes out of its data everything a mask hides (what was painted where a road or building has
+    /// since gone): for when the level is saved. How many were taken out.
+    /// </summary>
+    public int PruneMasked()
+    {
+        if (_maskIndex.IsEmpty)
+            return 0;
+        var gone = 0;
+        foreach (var (key, places) in _placed)
+            gone += places.RemoveAll(p => Masked(p.Origin, Height(key, p)));
+        if (gone > 0)
+            Commit();
+        return gone;
     }
 
     private static bool InOutline(Vector2[] outline, Vector2 point)
@@ -487,11 +570,15 @@ public partial class FoliageField : Node3D
     public void ThinOutTrees()
     {
         var before = Snapshot();
+        // The trees read here; which to take away worked out on a thread; taken away back here.
         var trees = _placed
             .Where(kv => _typesByKey.TryGetValue(kv.Key, out var t) && t.Tree)
             .SelectMany(kv => kv.Value.Select(p => (kv.Key, Place: p, Half: Crown(kv.Key) * Size(p) / 2f)))
-            .OrderByDescending(t => t.Half)
             .ToList();
+        FoliageJob.Start(this, $"Thin Out Trees ({base.Name})", job =>
+        {
+        trees = trees.OrderByDescending(t => t.Half).ToList();
+        job.SetTotal(trees.Count);
         // Biggest first: each kept unless a kept one is too near; looked up by stretch of ground.
         var reach = trees.Select(t => t.Half).DefaultIfEmpty(1f).Max() * 2f;
         var kept = new Dictionary<(int X, int Z), List<(Vector3 At, float Half)>>();
@@ -510,6 +597,7 @@ public partial class FoliageField : Node3D
                 }
             }
 
+            job.Step();
             if (tooNear)
                 gone.Add((key, place));
             else if (kept.TryGetValue(cell, out var list))
@@ -518,6 +606,11 @@ public partial class FoliageField : Node3D
                 kept[cell] = [(at, half)];
         }
 
+        return gone;
+        }, gone =>
+        {
+        if (!IsInstanceValid(this))
+            return;
         if (gone.Count == 0)
         {
             GD.Print($"{base.Name}: no trees whose crowns run into each other.");
@@ -540,6 +633,7 @@ public partial class FoliageField : Node3D
         }
 #endif
         Restore(after);
+        });
     }
 
     // ---- Following the ground ---------------------------------------------------------------
@@ -593,7 +687,7 @@ public partial class FoliageField : Node3D
     {
         if (!_chunks.TryGetValue((key, x, z), out var built) || !_parts.TryGetValue(key, out var parts))
             return;
-        var here = _placed[key].Where(t => Chunk(key, t) == (x, z) && !Masked(t.Origin)).ToList();
+        var here = _placed[key].Where(t => Chunk(key, t) == (x, z) && !Masked(t.Origin, Height(key, t))).ToList();
         var toLocal = GlobalTransform.AffineInverse();
         for (var d = 0; d < built.Draws.Count && d < parts.Meshes.Count; d++)
         {
@@ -602,14 +696,84 @@ public partial class FoliageField : Node3D
                 multi.SetInstanceTransform(i, toLocal * here[i] * parts.Meshes[d].At);
         }
 
-        if (built.Body is { } body)
+        if (parts.Shapes.Count > 0)
+            BodyChanged(key, x, z);
+    }
+
+    // ---- Bodies -------------------------------------------------------------------------------
+
+    /// <summary>
+    /// How far across each of its bodies is, in metres: one body holds the shapes of all its foliage
+    /// in a square this big, whatever their type, so a big forest is not tens of thousands of bodies
+    /// (the physics has a limit, and past it the terrain's own bodies are not made).
+    /// </summary>
+    private const float BodySize = 256f;
+
+    /// <summary>
+    /// Its bodies, by square: made straight on the physics server, not as nodes, so their shapes can be
+    /// put in while they are out of the world, and the world given each at once (put in a body already
+    /// in it, each shape had the physics build the whole body again: minutes for a forest).
+    /// </summary>
+    private readonly Dictionary<(int X, int Z), Rid> _bodies = [];
+    private readonly HashSet<(int X, int Z)> _bodiesChanged = [];
+
+    /// <summary>A stretch of a type built again: the body of its square to be built again, once, at the end of the frame.</summary>
+    private void BodyChanged(string key, int x, int z)
+    {
+        // Not in the editor: it never steps physics, and bodies of thousands of shapes only weigh on it.
+        if (Engine.IsEditorHint())
+            return;
+        var size = _tall.Contains(key) ? TreeChunkSize : ChunkSize;
+        var square = ((int)MathF.Floor(x * size / BodySize), (int)MathF.Floor(z * size / BodySize));
+        if (_bodiesChanged.Count == 0 && IsInsideTree())
+            Callable.From(BuildBodies).CallDeferred();
+        _bodiesChanged.Add(square);
+    }
+
+    /// <summary>The bodies of the squares changed, each with the shapes of everything in it: all its places gone over once.</summary>
+    private void BuildBodies()
+    {
+        if (!IsInstanceValid(this) || !IsInsideTree() || _bodiesChanged.Count == 0)
+            return;
+        var changed = _bodiesChanged.ToHashSet();
+        _bodiesChanged.Clear();
+        var shapes = changed.ToDictionary(c => c, _ => new List<(Shape3D Shape, Transform3D At)>());
+        foreach (var (key, places) in _placed)
         {
-            var shapes = parts.Shapes.Count;
-            for (var i = 0; i < here.Count; i++)
+            if (!_parts.TryGetValue(key, out var parts) || parts.Shapes.Count == 0)
+                continue;
+            foreach (var place in places)
             {
-                for (var s = 0; s < shapes; s++)
-                    PhysicsServer3D.BodySetShapeTransform(body.GetRid(), i * shapes + s, here[i] * parts.Shapes[s].At);
+                var square = ((int)MathF.Floor(place.Origin.X / BodySize), (int)MathF.Floor(place.Origin.Z / BodySize));
+                if (!shapes.TryGetValue(square, out var list) || Masked(place.Origin, Height(key, place)))
+                    continue;
+                foreach (var (shape, at) in parts.Shapes)
+                    list.Add((shape, place * at));
             }
+        }
+
+        var space = GetWorld3D().Space;
+        foreach (var (square, list) in shapes)
+        {
+            if (!_bodies.TryGetValue(square, out var body))
+            {
+                if (list.Count == 0)
+                    continue;
+                body = PhysicsServer3D.BodyCreate();
+                PhysicsServer3D.BodySetMode(body, PhysicsServer3D.BodyMode.Static);
+                PhysicsServer3D.BodySetCollisionLayer(body, 1);
+                PhysicsServer3D.BodySetCollisionMask(body, 1);
+                PhysicsServer3D.BodyAttachObjectInstanceId(body, GetInstanceId());
+                _bodies[square] = body;
+            }
+
+            // Out of the world while its shapes go in, then back in it once.
+            PhysicsServer3D.BodySetSpace(body, new Rid());
+            PhysicsServer3D.BodyClearShapes(body);
+            foreach (var (shape, at) in list)
+                PhysicsServer3D.BodyAddShape(body, shape.GetRid(), at);
+            if (list.Count > 0)
+                PhysicsServer3D.BodySetSpace(body, space);
         }
     }
 
@@ -637,9 +801,10 @@ public partial class FoliageField : Node3D
 
     /// <summary>
     /// Fills a circle with these types up to their density (times a share): new ones put at random
-    /// where none of the same type is nearer than its spacing, on the ground.
+    /// where none of the same type is nearer than its spacing, on the ground, inside its outline, and
+    /// (if any are given) only on the ground's textures allowed.
     /// </summary>
-    public void Paint(Vector3 centre, float radius, IReadOnlyList<FoliageType> types, float density, Random random)
+    public void Paint(Vector3 centre, float radius, IReadOnlyList<FoliageType> types, float density, Random random, IReadOnlyCollection<string>? allowed = null, FoliageDensityNoise? noise = null, bool buffers = true)
     {
         EnsureData();
         var area = MathF.PI * radius * radius;
@@ -689,9 +854,19 @@ public partial class FoliageField : Node3D
                 var scale = Mathf.Lerp(type.MinScale, type.MaxScale, random.NextSingle());
                 var half = type.Spacing * scale / 2f;
                 var crownHalf = myCrown * scale / 2f;
-                if (near.Any(p => Flat(p.Origin - at) < (p.ByCrown ? crownHalf : half) + p.Half) || Masked(at) || !type.AllowedAt(Ground(), at) || GroundAt(at) is not { } ground)
+                if (near.Any(p => Flat(p.Origin - at) < (p.ByCrown ? crownHalf : half) + p.Half) || !Inside(at) || !AllowedAt(allowed, at) || GroundAt(at) is not { } ground)
                     continue;
                 at.Y = ground.Height - type.Sink;
+                // Not under a road, a building, a lot or a square (see SetMasks): only where it fits.
+                if (!_maskIndex.IsEmpty && _maskIndex.Covers(at, TypeHeight(key) * scale, painting: true, buffers))
+                    continue;
+                // Thinner, or none, where the density noise is low: the spot counted as filled all the same.
+                if (noise is not null && random.NextSingle() > noise.At(at.X, at.Z))
+                {
+                    wanted--;
+                    continue;
+                }
+
                 var up = Vector3.Up.Lerp(ground.Normal, type.FollowSlope).Normalized();
                 var basis = new Basis(new Quaternion(Vector3.Up, up));
                 if (type.RandomTurn)
@@ -705,8 +880,7 @@ public partial class FoliageField : Node3D
             }
         }
 
-        foreach (var (key, x, z) in touched)
-            BuildChunk(key, x, z);
+        BuildChunks(touched);
     }
 
     /// <summary>How many tries in a row may fail before a touch of the brush stops trying: the area is as full as it can get, or nothing may go there.</summary>
@@ -720,10 +894,10 @@ public partial class FoliageField : Node3D
         {
             if (!_placed.TryGetValue(key, out var places))
                 continue;
-            var gone = places.Where(p => Flat(p.Origin - centre) <= radius && !Masked(p.Origin)).ToList();
+            var gone = places.Where(p => Flat(p.Origin - centre) <= radius && !Masked(p.Origin, Height(key, p))).ToList();
             if (gone.Count == 0)
                 continue;
-            places.RemoveAll(p => Flat(p.Origin - centre) <= radius && !Masked(p.Origin));
+            places.RemoveAll(p => Flat(p.Origin - centre) <= radius && !Masked(p.Origin, Height(key, p)));
             foreach (var (X, Z) in gone.Select(t => Chunk(key, t)).Distinct())
                 BuildChunk(key, X, Z);
         }

@@ -82,17 +82,6 @@ public partial class FoliageType : Resource
     [Export(PropertyHint.Range, "0,2,0.01,suffix:m")]
     public float Sink { get; set; } = 0.05f;
 
-    /// <summary>The names of the ground's textures it may be painted on: only where nothing else shows, so in a fade only between these. With none, it may be painted on any.</summary>
-    [Export]
-    public string[] AllowedTextures { get; set; } = [];
-
-    /// <summary>How much of what is seen of the ground must be its allowed textures for it to be painted there.</summary>
-    private const float AllowedShare = 0.9f;
-
-    /// <summary>Whether it may be painted at a place on this ground; where the ground can't say, it may.</summary>
-    public bool AllowedAt(IFoliageGround? ground, Vector3 at) =>
-        AllowedTextures.Length == 0 || ground?.ShareOf(at, AllowedTextures) is not { } share || share >= AllowedShare;
-
     /// <summary>What it is made of, taken from its scene: its meshes and its collision shapes, each placed as in the scene.</summary>
     public (List<(Mesh Mesh, Material? Material, Transform3D At)> Meshes, List<(Shape3D Shape, Transform3D At)> Shapes) Parts()
     {
