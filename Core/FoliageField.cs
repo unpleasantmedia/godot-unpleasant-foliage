@@ -89,7 +89,40 @@ public partial class FoliageField : Node3D
     private readonly Dictionary<string, List<Transform3D>> _placed = [];
 
     /// <summary>What each stretch of each type is built as: its draws and its body.</summary>
-    private readonly Dictionary<(string Type, int X, int Z), (List<MultiMeshInstance3D> Draws, StaticBody3D? Body)> _chunks = [];
+    private readonly Dictionary<(string Type, int X, int Z), (List<Draw> Draws, StaticBody3D? Body)> _chunks = [];
+
+    /// <summary>
+    /// One mesh of a stretch's foliage drawn many times: made straight on the rendering server, not
+    /// as a node (a big forest is tens of thousands of them: as nodes, they held up loading a level
+    /// for many seconds). Whether it is a tree's, for its view distance and its shadows.
+    /// </summary>
+    private sealed record Draw(Rid Instance, MultiMesh Multi, bool Tall)
+    {
+        /// <summary>Whether it casts shadows now (see _Process): only told the rendering server when it changes.</summary>
+        public bool Shadows { get; set; } = true;
+    }
+
+    /// <summary>How far off a draw is drawn: in a game, no further than its player set (trees to the tree
+    /// distance, the rest to the foliage distance); in the editor, its own (or hundreds of thousands are).</summary>
+    private static void DrawDistance(Draw draw)
+    {
+        var distance = Engine.IsEditorHint() ? draw.Tall ? EditorTreeDistance : EditorViewDistance
+            : draw.Tall ? TreeDistance : ViewDistance;
+        RenderingServer.InstanceGeometrySetVisibilityRange(draw.Instance, 0f, Mathf.Max(distance, 0f), 0f, 0f, RenderingServer.VisibilityRangeFadeMode.Disabled);
+    }
+
+    /// <summary>The view distances set (see ViewDistance and TreeDistance): every field's foliage drawn to them.</summary>
+    public static void ApplyDistances(SceneTree tree)
+    {
+        foreach (var field in InTree(tree))
+        {
+            foreach (var (draws, _) in field._chunks.Values)
+            {
+                foreach (var draw in draws)
+                    DrawDistance(draw);
+            }
+        }
+    }
 
     /// <summary>The group of its draws, for a game's view distance setting to find.</summary>
     public const string ViewDistanceGroup = "FoliageViewDistance";
@@ -126,6 +159,24 @@ public partial class FoliageField : Node3D
     public static event Action<FoliageField>? Entered;
 
     public override void _ExitTree() => Clear();
+
+    public override void _Ready() => SetNotifyTransform(true);
+
+    // Its draws are its own on the rendering server: shown or hidden, and moved, with it.
+    public override void _Notification(int what)
+    {
+        if (what is not ((int)NotificationVisibilityChanged or (int)NotificationTransformChanged) || !IsInsideTree())
+            return;
+        var (visible, at) = (IsVisibleInTree(), GlobalTransform);
+        foreach (var (draws, _) in _chunks.Values)
+        {
+            foreach (var draw in draws)
+            {
+                RenderingServer.InstanceSetVisible(draw.Instance, visible);
+                RenderingServer.InstanceSetTransform(draw.Instance, at);
+            }
+        }
+    }
 
     /// <summary>
     /// How near the camera trees cast shadows, in metres, in a game: further off, theirs are too small
@@ -173,8 +224,10 @@ public partial class FoliageField : Node3D
             var cast = near ? GeometryInstance3D.ShadowCastingSetting.On : GeometryInstance3D.ShadowCastingSetting.Off;
             foreach (var draw in draws)
             {
-                if (draw.CastShadow != cast)
-                    draw.CastShadow = cast;
+                if (draw.Shadows == near)
+                    continue;
+                draw.Shadows = near;
+                RenderingServer.InstanceGeometrySetCastShadowsSetting(draw.Instance, (RenderingServer.ShadowCastingSetting)cast);
             }
         }
     }
@@ -240,11 +293,18 @@ public partial class FoliageField : Node3D
             foreach (var stretch in places.GroupBy(t => Chunk(key, t)))
                 BuildChunk(key, stretch.Key.X, stretch.Key.Z, [.. stretch]);
         }
+
     }
 
     /// <summary>Takes away everything it has built.</summary>
     private void Clear()
     {
+        foreach (var (draws, _) in _chunks.Values)
+        {
+            foreach (var draw in draws)
+                RenderingServer.FreeRid(draw.Instance);
+        }
+
         // All it built, including any left from before its scripts were reloaded (it forgets them then).
         foreach (var built in GetChildren(true).Where(c => c is MultiMeshInstance3D or StaticBody3D && c.Name.ToString().StartsWith(BuiltName)))
         {
@@ -301,7 +361,8 @@ public partial class FoliageField : Node3D
 
     private void BuildChunk(string key, int x, int z, List<Transform3D>? those = null)
     {
-        if (!_placed.TryGetValue(key, out var all) || !_parts.TryGetValue(key, out var parts))
+        // Out of the tree: nothing to draw into (built again in full as it comes back).
+        if (!IsInsideTree() || !_placed.TryGetValue(key, out var all) || !_parts.TryGetValue(key, out var parts))
             return;
         // Its places: as given (already sorted out by stretch), or found among all of them.
         var here = (those ?? all.Where(t => Chunk(key, t) == (x, z))).Where(t => !Masked(t.Origin, Height(key, t))).ToList();
@@ -321,33 +382,34 @@ public partial class FoliageField : Node3D
         for (var d = 0; d < parts.Meshes.Count; d++)
         {
             var (mesh, material, at) = parts.Meshes[d];
-            var multi = built ? draws[d].Multimesh : new MultiMesh { TransformFormat = MultiMesh.TransformFormatEnum.Transform3D, UseColors = coloured, Mesh = mesh };
+            var multi = built ? draws[d].Multi : new MultiMesh { TransformFormat = MultiMesh.TransformFormatEnum.Transform3D, UseColors = coloured, Mesh = mesh };
             multi.InstanceCount = here.Count;
+            // All its places given at once (one call, not one per place: thousands to a stretch of forest).
+            var stride = colours is not null ? 16 : 12;
+            var buffer = new float[here.Count * stride];
             for (var i = 0; i < here.Count; i++)
             {
-                multi.SetInstanceTransform(i, toLocal * here[i] * at);
+                var t = toLocal * here[i] * at;
+                var (b, o, k) = (t.Basis, t.Origin, i * stride);
+                (buffer[k], buffer[k + 1], buffer[k + 2], buffer[k + 3]) = (b.X.X, b.Y.X, b.Z.X, o.X);
+                (buffer[k + 4], buffer[k + 5], buffer[k + 6], buffer[k + 7]) = (b.X.Y, b.Y.Y, b.Z.Y, o.Y);
+                (buffer[k + 8], buffer[k + 9], buffer[k + 10], buffer[k + 11]) = (b.X.Z, b.Y.Z, b.Z.Z, o.Z);
                 if (colours is not null)
-                    multi.SetInstanceColor(i, colours[i]);
+                    (buffer[k + 12], buffer[k + 13], buffer[k + 14], buffer[k + 15]) = (colours[i].R, colours[i].G, colours[i].B, colours[i].A);
             }
+
+            if (here.Count > 0)
+                multi.Buffer = buffer;
 
             if (built)
                 continue;
-            var draw = new MultiMeshInstance3D { Name = BuiltName, Multimesh = multi, MaterialOverride = material };
-            // A name of its own (not one Godot makes unique by trying Foliage2, Foliage3, ... against
-            // thousands of others, which took seconds as a big level loaded).
-            draw.Name = $"{BuiltName}{++_built}";
-            AddChild(draw, false, InternalMode.Back);
-            // In a game, drawn no further off than its player set: trees to the tree distance, smaller
-            // foliage to the foliage distance.
-            var tall = mesh.GetAabb().Size.Y > TallHeight;
-            var distance = tall ? TreeDistance : ViewDistance;
-            // In the editor, no further than its own distances (or there are hundreds of thousands drawn).
-            if (Engine.IsEditorHint())
-                distance = tall ? EditorTreeDistance : EditorViewDistance;
-            if (distance > 0f)
-                draw.VisibilityRangeEnd = distance;
-            draw.AddToGroup(tall ? TreeGroup : ViewDistanceGroup);
-
+            var instance = RenderingServer.InstanceCreate2(multi.GetRid(), GetWorld3D().Scenario);
+            RenderingServer.InstanceSetTransform(instance, GlobalTransform);
+            if (material is not null)
+                RenderingServer.InstanceGeometrySetMaterialOverride(instance, material.GetRid());
+            RenderingServer.InstanceSetVisible(instance, IsVisibleInTree());
+            var draw = new Draw(instance, multi, mesh.GetAabb().Size.Y > TallHeight);
+            DrawDistance(draw);
             draws.Add(draw);
         }
 
@@ -440,6 +502,14 @@ public partial class FoliageField : Node3D
     {
         if (!IsInstanceValid(this))
             return;
+        // Out of the tree by now (another scene opened in the editor): nothing to draw into, and it
+        // is built again in full as it comes back (see _EnterTree), masks and all.
+        if (!IsInsideTree())
+        {
+            _maskChanges.Clear();
+            return;
+        }
+
         var changed = new HashSet<(int, int)>();
         foreach (var area in _maskChanges)
         {
@@ -691,7 +761,7 @@ public partial class FoliageField : Node3D
         var toLocal = GlobalTransform.AffineInverse();
         for (var d = 0; d < built.Draws.Count && d < parts.Meshes.Count; d++)
         {
-            var multi = built.Draws[d].Multimesh;
+            var multi = built.Draws[d].Multi;
             for (var i = 0; i < here.Count && i < multi.InstanceCount; i++)
                 multi.SetInstanceTransform(i, toLocal * here[i] * parts.Meshes[d].At);
         }
@@ -775,6 +845,7 @@ public partial class FoliageField : Node3D
             if (list.Count > 0)
                 PhysicsServer3D.BodySetSpace(body, space);
         }
+
     }
 
     // ---- Painting -------------------------------------------------------------------------
