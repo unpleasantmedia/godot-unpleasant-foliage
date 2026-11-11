@@ -11,8 +11,8 @@ namespace UnpleasantMedia.UnpleasantFoliage;
 /// its top): so a viaduct's deck (from its underside up) leaves room under it for what is short
 /// enough, and a tunnel (up to its roof) leaves the ground over it free.
 /// </summary>
-/// <para>A buffer (<paramref name="PaintingOnly"/>: one along a road, say) counts only while buffers are kept (see FoliageField.KeepBuffers).</para>
-public readonly record struct FoliageMaskShape(Vector2[] Outline, float Bottom = float.NegativeInfinity, float Top = float.PositiveInfinity, bool PaintingOnly = false);
+/// <para>A buffer (one along a road, or round a building: <paramref name="Buffer"/> names which kind) counts only while that kind is kept (see FoliageField.KeptBuffers).</para>
+public readonly record struct FoliageMaskShape(Vector2[] Outline, float Bottom = float.NegativeInfinity, float Top = float.PositiveInfinity, string? Buffer = null);
 
 /// <summary>
 /// The masks of a field, by name, looked up by square so that a place is checked only against the
@@ -24,7 +24,7 @@ public sealed class FoliageMaskIndex
     /// <summary>How far across each square of the lookup is, in metres.</summary>
     private const float Square = 64f;
 
-    private sealed record Shape(Vector2[] Outline, Rect2 Bounds, float Bottom, float Top, bool PaintingOnly);
+    private sealed record Shape(Vector2[] Outline, Rect2 Bounds, float Bottom, float Top, string? Buffer);
 
     private readonly Dictionary<string, List<Shape>> _byName = [];
     private readonly Dictionary<(int, int), List<Shape>> _bySquare = [];
@@ -35,7 +35,7 @@ public sealed class FoliageMaskIndex
     public List<Rect2> Set(string name, IReadOnlyList<FoliageMaskShape> shapes)
     {
         var changed = Remove(name);
-        var made = shapes.Where(s => s.Outline.Length >= 3).Select(s => new Shape([.. s.Outline], Bounds(s.Outline), s.Bottom, s.Top, s.PaintingOnly)).ToList();
+        var made = shapes.Where(s => s.Outline.Length >= 3).Select(s => new Shape([.. s.Outline], Bounds(s.Outline), s.Bottom, s.Top, s.Buffer)).ToList();
         if (made.Count == 0)
             return changed;
         _byName[name] = made;
@@ -76,17 +76,17 @@ public sealed class FoliageMaskIndex
     }
 
     /// <summary>
-    /// Whether foliage standing at a place, this tall, is under any of them: painting, also those that
-    /// only keep painting off (if <paramref name="buffers"/>).
+    /// Whether foliage standing at a place, this tall, is under any of them: of the buffers, only those
+    /// of the kinds in <paramref name="buffers"/> (all of them if none are given).
     /// </summary>
-    public bool Covers(Vector3 at, float height, bool painting = false, bool buffers = true)
+    public bool Covers(Vector3 at, float height, bool painting = false, IReadOnlyCollection<string>? buffers = null)
     {
         if (_bySquare.Count == 0 || !_bySquare.TryGetValue(SquareOf(at.X, at.Z), out var near))
             return false;
         var point = new Vector2(at.X, at.Z);
         foreach (var shape in near)
         {
-            if (shape.PaintingOnly && !buffers)
+            if (shape.Buffer is not null && buffers is not null && !buffers.Contains(shape.Buffer))
                 continue;
             if (at.Y >= shape.Top || at.Y + height <= shape.Bottom)
                 continue;
@@ -103,7 +103,7 @@ public sealed class FoliageMaskIndex
     {
         var copy = new FoliageMaskIndex();
         foreach (var (name, shapes) in _byName)
-            copy.Set(name, shapes.Select(s => new FoliageMaskShape(s.Outline, s.Bottom, s.Top, s.PaintingOnly)).ToList());
+            copy.Set(name, shapes.Select(s => new FoliageMaskShape(s.Outline, s.Bottom, s.Top, s.Buffer)).ToList());
         return copy;
     }
 

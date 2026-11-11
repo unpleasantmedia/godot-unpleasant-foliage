@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using Godot;
@@ -533,29 +533,33 @@ public partial class FoliageField : Node3D
     }
 
     /// <summary>Whether foliage at a place, this tall, is under a mask.</summary>
-    private bool Masked(Vector3 at, float height = 0f) => !_maskIndex.IsEmpty && _maskIndex.Covers(at, height, buffers: KeepBuffers);
+    private bool Masked(Vector3 at, float height = 0f) => !_maskIndex.IsEmpty && _maskIndex.Covers(at, height, buffers: KeptBuffers);
+
+    /// <summary>The kind of buffer along roads (see FoliageMaskShape.Buffer).</summary>
+    public const string RoadBuffers = "roads";
+
+    /// <summary>The kind of buffer round buildings.</summary>
+    public const string BuildingBuffers = "buildings";
 
     /// <summary>
-    /// Whether buffers (along roads, say: see FoliageMaskShape) keep foliage off, hidden and painted
-    /// round: set by the Foliage dock. Changed, every field is built again.
+    /// The kinds of buffer (see FoliageMaskShape.Buffer) that keep foliage off, hidden and painted
+    /// round: all of them unless the Foliage dock says otherwise (see SetBufferKept).
     /// </summary>
-    public static bool KeepBuffers
+    public static IReadOnlyCollection<string> KeptBuffers => _keptBuffers;
+
+    private static readonly HashSet<string> _keptBuffers = [RoadBuffers, BuildingBuffers];
+
+    /// <summary>Whether a kind of buffer keeps foliage off: changed, every field is built again.</summary>
+    public static void SetBufferKept(string kind, bool kept)
     {
-        get => _keepBuffers;
-        set
+        if (!(kept ? _keptBuffers.Add(kind) : _keptBuffers.Remove(kind)))
+            return;
+        if (Engine.GetMainLoop() is SceneTree tree)
         {
-            if (_keepBuffers == value)
-                return;
-            _keepBuffers = value;
-            if (Engine.GetMainLoop() is SceneTree tree)
-            {
-                foreach (var field in InTree(tree))
-                    field.QueueRebuild();
-            }
+            foreach (var field in InTree(tree))
+                field.QueueRebuild();
         }
     }
-
-    private static bool _keepBuffers = true;
 
     /// <summary>How tall a type's foliage is at full size: the top of its meshes, from its foot.</summary>
     private float TypeHeight(string key)
@@ -875,7 +879,7 @@ public partial class FoliageField : Node3D
     /// where none of the same type is nearer than its spacing, on the ground, inside its outline, and
     /// (if any are given) only on the ground's textures allowed.
     /// </summary>
-    public void Paint(Vector3 centre, float radius, IReadOnlyList<FoliageType> types, float density, Random random, IReadOnlyCollection<string>? allowed = null, FoliageDensityNoise? noise = null, bool buffers = true)
+    public void Paint(Vector3 centre, float radius, IReadOnlyList<FoliageType> types, float density, Random random, IReadOnlyCollection<string>? allowed = null, FoliageDensityNoise? noise = null, IReadOnlyCollection<string>? buffers = null)
     {
         EnsureData();
         var area = MathF.PI * radius * radius;
@@ -914,7 +918,10 @@ public partial class FoliageField : Node3D
 
             var myCrown = Crown(key);
 
-            var wanted = (int)MathF.Round(area * type.Density / 100f * density) - mine;
+            // As many as its density gives, thinned as the density noise is over the circle on the whole:
+            // so painting over the same spot again tops it up to what autopainting leaves, never fuller
+            // (with the noise only rolled for each new one, every touch filled a clearing's edges further).
+            var wanted = (int)MathF.Round(area * type.Density / 100f * density * (noise?.Average(centre.X, centre.Z, radius) ?? 1f)) - mine;
             var misses = 0;
             for (var attempt = 0; wanted > 0 && attempt < wanted * 8 && misses < GiveUpAfter; attempt++)
             {
@@ -931,12 +938,12 @@ public partial class FoliageField : Node3D
                 // Not under a road, a building, a lot or a square (see SetMasks): only where it fits.
                 if (!_maskIndex.IsEmpty && _maskIndex.Covers(at, TypeHeight(key) * scale, painting: true, buffers))
                     continue;
-                // Thinner, or none, where the density noise is low: the spot counted as filled all the same.
-                if (noise is not null && random.NextSingle() > noise.At(at.X, at.Z))
-                {
-                    wanted--;
+                // Where the density noise is low, only in some of the ground's cells (none where it is
+                // open): the same ones each time (see FoliageDensityNoise.Allows).
+                // Cells of one's room at its biggest (by crown, for a tree), so each holds about one: kept
+                // as often as the noise says, as many are as autopainting keeps.
+                if (noise is not null && !noise.Allows(at.X, at.Z, MathF.Max(type.Spacing, type.Tree ? myCrown : 0f) * type.MaxScale, StableSalt(key)))
                     continue;
-                }
 
                 var up = Vector3.Up.Lerp(ground.Normal, type.FollowSlope).Normalized();
                 var basis = new Basis(new Quaternion(Vector3.Up, up));
@@ -952,6 +959,15 @@ public partial class FoliageField : Node3D
         }
 
         BuildChunks(touched);
+    }
+
+    /// <summary>A number for a type, the same every run (string.GetHashCode is not).</summary>
+    internal static int StableSalt(string key)
+    {
+        var h = 17;
+        foreach (var c in key)
+            h = unchecked(h * 31 + c);
+        return h;
     }
 
     /// <summary>How many tries in a row may fail before a touch of the brush stops trying: the area is as full as it can get, or nothing may go there.</summary>

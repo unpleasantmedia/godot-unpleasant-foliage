@@ -245,7 +245,7 @@ public partial class FoliageField
     /// any thread, and <see cref="ApplyFill"/> puts them in, back on the main thread. Null if it has
     /// no outline.
     /// </summary>
-    public FillJob? PrepareFill(IReadOnlyList<FoliageType> types, float density, ulong seed, IReadOnlyCollection<string>? allowed, float falloff = 0f, FoliageDensityNoise? noise = null, bool buffers = true)
+    public FillJob? PrepareFill(IReadOnlyList<FoliageType> types, float density, ulong seed, IReadOnlyCollection<string>? allowed, float falloff = 0f, FoliageDensityNoise? noise = null, IReadOnlyCollection<string>? buffers = null)
     {
         var outline = Outline;
         if (outline.Length < 3)
@@ -288,7 +288,7 @@ public partial class FoliageField
         }
 
         var masks = _maskIndex.Copy();
-        return new FillJob(this, outline, _outlineBounds, Ground(), allowed?.ToArray() ?? [], masks, density, falloff, seed, jobs, noise, buffers);
+        return new FillJob(this, outline, _outlineBounds, Ground(), allowed?.ToArray() ?? [], masks, density, falloff, seed, jobs, noise, buffers?.ToArray());
     }
 
     /// <summary>A fill worked out: its places put in, and the stretches they are in built again.</summary>
@@ -328,7 +328,7 @@ public partial class FoliageField
         private readonly Random _random;
         private readonly List<TypeJob> _types;
         private readonly FoliageDensityNoise? _noise;
-        private readonly bool _buffers;
+        private readonly IReadOnlyCollection<string>? _buffers;
 
         /// <summary>The places found, by type.</summary>
         public List<(string Key, List<Transform3D> Places)> Results { get; } = [];
@@ -339,7 +339,7 @@ public partial class FoliageField
         public long Done => System.Threading.Interlocked.Read(ref _done);
 
         public FillJob(FoliageField field, Vector2[] outline, Rect2 bounds, IFoliageGround? ground, string[] allowed, FoliageMaskIndex masks,
-            float density, float falloff, ulong seed, List<TypeJob> types, FoliageDensityNoise? noise = null, bool buffers = true)
+            float density, float falloff, ulong seed, List<TypeJob> types, FoliageDensityNoise? noise = null, IReadOnlyCollection<string>? buffers = null)
         {
             _noise = noise;
             _buffers = buffers;

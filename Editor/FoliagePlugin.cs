@@ -115,7 +115,12 @@ public partial class FoliagePlugin : EditorPlugin
             TooltipText = "Foliage is kept off roads' foliage buffers (set on the road network, or a road of its own): hidden there, removed on save, and not painted there." };
         _roadBuffer.Connect(BaseButton.SignalName.Toggled, new Callable(this, MethodName.RoadBufferToggled));
         _dock.AddChild(_roadBuffer);
-        FoliageField.KeepBuffers = _roadBuffer.ButtonPressed;
+        FoliageField.SetBufferKept(FoliageField.RoadBuffers, _roadBuffer.ButtonPressed);
+        _buildingBuffer = new CheckBox { Text = "Keep Building Buffers", ButtonPressed = Saved("building_buffer", true).AsBool(),
+            TooltipText = "Foliage is kept off buildings' foliage buffers (set on the building cluster, or a building of its own): hidden there, removed on save, and not painted there." };
+        _buildingBuffer.Connect(BaseButton.SignalName.Toggled, new Callable(this, MethodName.BuildingBufferToggled));
+        _dock.AddChild(_buildingBuffer);
+        FoliageField.SetBufferKept(FoliageField.BuildingBuffers, _buildingBuffer.ButtonPressed);
         _dock.AddChild(new HSeparator());
         AddNoiseSection(_dock);
         _dock.AddChild(new HSeparator());
@@ -161,14 +166,22 @@ public partial class FoliagePlugin : EditorPlugin
 
     private CheckBox? _roadBuffer;
 
+    private CheckBox? _buildingBuffer;
+
     private void RoadBufferToggled(bool on)
     {
         Save("road_buffer", on);
-        FoliageField.KeepBuffers = on;
+        FoliageField.SetBufferKept(FoliageField.RoadBuffers, on);
     }
 
-    /// <summary>Whether painting keeps off roads' foliage buffers.</summary>
-    private bool KeepBuffers => _roadBuffer?.ButtonPressed ?? true;
+    private void BuildingBufferToggled(bool on)
+    {
+        Save("building_buffer", on);
+        FoliageField.SetBufferKept(FoliageField.BuildingBuffers, on);
+    }
+
+    /// <summary>The kinds of buffer painting keeps off (see FoliageField.KeptBuffers).</summary>
+    private static IReadOnlyCollection<string> KeepBuffers => FoliageField.KeptBuffers;
 
     // ---- Density noise ----------------------------------------------------------------------
 
